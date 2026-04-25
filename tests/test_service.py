@@ -59,10 +59,10 @@ class FakeHypervolt:
 
 class FakeGrowatt:
     def __init__(self):
-        # ("set", start, end) | ("disable",)
+        # ("set", start, end) | ("clear_dynamic",)
         self.calls: list[tuple] = []
         self.fail_next_set = False
-        self.fail_next_disable = False
+        self.fail_next_clear = False
 
     async def set_ac_charge(self, start, end):
         if self.fail_next_set:
@@ -70,11 +70,11 @@ class FakeGrowatt:
             raise RuntimeError("boom")
         self.calls.append(("set", start, end))
 
-    async def disable_ac_charge(self):
-        if self.fail_next_disable:
-            self.fail_next_disable = False
+    async def clear_dynamic_window(self):
+        if self.fail_next_clear:
+            self.fail_next_clear = False
             raise RuntimeError("boom")
-        self.calls.append(("disable",))
+        self.calls.append(("clear_dynamic",))
 
 
 def _service() -> Service:
@@ -131,7 +131,7 @@ async def test_falling_edge_disables():
 
     await s._evaluate_once(_at("06:00"))
     assert s._cheap_now is False
-    assert s._growatt.calls[-1] == ("disable",)
+    assert s._growatt.calls[-1] == ("clear_dynamic",)
     assert s._last_growatt_write is None
 
 
@@ -171,19 +171,19 @@ async def test_failed_rising_write_self_heals_next_tick():
 
 
 @pytest.mark.asyncio
-async def test_failed_falling_disable_does_not_clear_state():
+async def test_failed_falling_clear_does_not_clear_state():
     s = _service()
     await s._evaluate_once(_at("00:30"))
     assert s._cheap_now is True
 
-    s._growatt.fail_next_disable = True
+    s._growatt.fail_next_clear = True
     await s._evaluate_once(_at("06:00"))
-    # Disable failed: cheap_now stays True so next tick will retry the disable.
+    # Clear failed: cheap_now stays True so next tick will retry the clear.
     assert s._cheap_now is True
 
     await s._evaluate_once(_at("06:01"))
     assert s._cheap_now is False
-    assert s._growatt.calls[-1] == ("disable",)
+    assert s._growatt.calls[-1] == ("clear_dynamic",)
 
 
 @pytest.mark.asyncio

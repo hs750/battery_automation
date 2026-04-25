@@ -1,5 +1,16 @@
 """Growatt SPH3000 control via the OpenAPI v1 cloud (growattServer >= 2.1.0).
 
+Slot layout on the inverter is fixed by this client:
+  - slot 1: permanent cheap-window fallback (the inverter accepts wrap-around
+            time-of-day pairs natively, so 23:30→05:30 fits in a single slot)
+  - slot 2: dynamic slot, written/cleared by the live decision loop
+  - slot 3: unused
+
+The permanent slot is re-asserted on every write, so the cheap window stays
+honored even if this process crashes — the inverter will keep AC-charging
+during 23:30–05:30 (or whatever the configured cheap window is) regardless of
+the script's state.
+
 DST note: writes are time-of-day local (Europe/London). Around DST transitions
 a 15-min slot crossing 01:00–02:00 may execute twice (autumn fall-back) or be
 skipped (spring forward). The 15-min sliding window bounds the impact.
@@ -34,28 +45,39 @@ class GrowattClient:
         device_sn: str,
         charge_power_percent: int,
         charge_stop_soc: int,
+        cheap_window_start: time,
+        cheap_window_end: time,
     ) -> None:
         self._api = growattServer.OpenApiV1(token=api_token)
         self._device_sn = device_sn
         self._charge_power = charge_power_percent
         self._charge_stop_soc = charge_stop_soc
+        self._cheap_period = {
+            "start_time": cheap_window_start,
+            "end_time": cheap_window_end,
+            "enabled": True,
+        }
 
     async def set_ac_charge(self, start: datetime, end: datetime) -> None:
-        """Configure period 1 to AC-charge from `start` to `end` (Europe/London local time)."""
+        """Activate the dynamic slot for `start`→`end` (Europe/London local time)."""
         start_local = start.astimezone(LONDON).time().replace(second=0, microsecond=0)
         end_local = end.astimezone(LONDON).time().replace(second=0, microsecond=0)
-        periods = [
-            {"start_time": start_local, "end_time": end_local, "enabled": True},
-            _DISABLED_PERIOD,
-            _DISABLED_PERIOD,
-        ]
+        dynamic = {"start_time": start_local, "end_time": end_local, "enabled": True}
         log.info(
-            "growatt: enabling AC-charge %s → %s (power=%d%%, stop_soc=%d%%)",
+            "growatt: enabling dynamic AC-charge %s → %s (power=%d%%, stop_soc=%d%%)",
             start_local.strftime("%H:%M"),
             end_local.strftime("%H:%M"),
             self._charge_power,
             self._charge_stop_soc,
         )
+        await self._write_periods([self._cheap_period, dynamic, _DISABLED_PERIOD])
+
+    async def clear_dynamic_window(self) -> None:
+        """Disable the dynamic slot. Permanent cheap-window fallback stays active."""
+        log.info("growatt: clearing dynamic AC-charge slot (permanent fallback retained)")
+        await self._write_periods([self._cheap_period, _DISABLED_PERIOD, _DISABLED_PERIOD])
+
+    async def _write_periods(self, periods: list[dict]) -> None:
         await self._call_with_retry(
             self._api.sph_write_ac_charge_times,
             device_sn=self._device_sn,
@@ -63,18 +85,6 @@ class GrowattClient:
             charge_stop_soc=self._charge_stop_soc,
             mains_enabled=True,
             periods=periods,
-        )
-
-    async def disable_ac_charge(self) -> None:
-        """Clear all three time periods and disable mains charging."""
-        log.info("growatt: disabling AC-charge")
-        await self._call_with_retry(
-            self._api.sph_write_ac_charge_times,
-            device_sn=self._device_sn,
-            charge_power=self._charge_power,
-            charge_stop_soc=self._charge_stop_soc,
-            mains_enabled=False,
-            periods=[_DISABLED_PERIOD, _DISABLED_PERIOD, _DISABLED_PERIOD],
         )
 
     async def _call_with_retry(self, fn, /, **kwargs) -> None:

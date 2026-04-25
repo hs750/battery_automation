@@ -42,17 +42,20 @@ class Service:
                 cfg.growatt_device_sn,
                 cfg.charge_power_percent,
                 cfg.charge_stop_soc,
+                cfg.cheap_window_start,
+                cfg.cheap_window_end,
             ),
         )
 
     async def run(self) -> None:
-        # Clear any pre-existing schedule on the inverter so this script owns it entirely.
-        # Non-fatal: if the cloud is unreachable, the next falling edge will re-attempt.
+        # Re-assert the permanent cheap-window slot and clear any stale dynamic slot
+        # so the inverter starts from a known baseline that this script owns.
+        # Non-fatal: if the cloud is unreachable, the next decision-edge will re-attempt.
         try:
-            await self._growatt.disable_ac_charge()
+            await self._growatt.clear_dynamic_window()
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "startup: failed to clear AC-charge schedule: %s; "
+                "startup: failed to assert permanent slot / clear dynamic: %s; "
                 "continuing — will recover on next decision tick",
                 e,
             )
@@ -67,11 +70,13 @@ class Service:
                 return_exceptions=False,
             )
         finally:
-            log.info("shutting down: clearing AC-charge schedule")
+            log.info("shutting down: clearing dynamic slot (permanent fallback retained)")
             try:
-                await asyncio.wait_for(self._growatt.disable_ac_charge(), timeout=15.0)
+                await asyncio.wait_for(
+                    self._growatt.clear_dynamic_window(), timeout=15.0
+                )
             except Exception as e:  # noqa: BLE001
-                log.error("failed to clear schedule on shutdown: %s", e)
+                log.error("failed to clear dynamic slot on shutdown: %s", e)
             await self._hypervolt.aclose()
             await self._octopus.aclose()
 
@@ -127,9 +132,9 @@ class Service:
         elif not decision.cheap_now and self._cheap_now:
             log.info("cheap_now → False (%s)", decision.reason)
             try:
-                await self._growatt.disable_ac_charge()
+                await self._growatt.clear_dynamic_window()
             except Exception as e:  # noqa: BLE001
-                log.error("failed to disable AC-charge: %s", e)
+                log.error("failed to clear dynamic slot: %s", e)
                 return
             self._last_growatt_write = None
         self._cheap_now = decision.cheap_now
