@@ -53,7 +53,7 @@ def load_config() -> Config:
         hypervolt_password=_required("HYPERVOLT_PASSWORD"),
         growatt_api_token=_required("GROWATT_API_TOKEN"),
         growatt_device_sn=_required("GROWATT_DEVICE_SN"),
-        cheap_window_start=_parse_hhmm(os.environ.get("CHEAP_WINDOW_START", "23:00")),
+        cheap_window_start=_parse_hhmm(os.environ.get("CHEAP_WINDOW_START", "23:30")),
         cheap_window_end=_parse_hhmm(os.environ.get("CHEAP_WINDOW_END", "05:30")),
         charge_power_percent=int(os.environ.get("CHARGE_POWER_PERCENT", "100")),
         charge_stop_soc=int(os.environ.get("CHARGE_STOP_SOC", "100")),
