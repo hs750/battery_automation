@@ -46,7 +46,7 @@ Re-evaluate every 60s. The script writes to the inverter only on **edges** (fals
 - **No standalone PyPI lib** and **no local LAN API**. The charger runs internally on a Pi but no local endpoint has been reverse-engineered.
 - **Auth**: Keycloak `password` grant at `https://kc.prod.hypervolt.co.uk/realms/retail-customers/protocol/openid-connect/token` → bearer token. Email + password (the Hypervolt app login). No SSO. Requires app v5.3+ era credentials.
 - **Live state**: WebSocket at `wss://api.hypervolt.co.uk/ws/charger/{charger_id}/sync`. Push, no polling needed for state changes.
-- **Fields used**: `release` (bool — **inverted**: `release=false` means "actively charging") and `ct_power` (watts).
+- **Fields used**: `ct_power` (watts; primary signal — `> 1000` means actively charging) and `charging` (bool, from session-in-progress messages; fallback). We deliberately ignore `release_state`: verified against gndean's `hypervolt_device_state.py`, it's an enum tracking user-cancellation (`RELEASED`/`DEFAULT`), not power delivery.
 - **Home 3 Pro**: fully supported, including V3-only fields (car-plugged-in flag, session charge mode).
 - **Resilience**: WS can drop; reconnect with exponential backoff and a 60s REST fallback poll on the same auth.
 
@@ -55,7 +55,7 @@ Re-evaluate every 60s. The script writes to the inverter only on **edges** (fals
 - **Library**: `growattServer` 2.1.0 on PyPI (<https://github.com/indykoning/PyPi_GrowattServer>, last release 2026-04-16). Active.
 - **Auth**: API token from ShinePhone app → Me → API Token (or `openapi.growatt.com` web UI → Account Management). One-time setup; user must request the token in-app.
 - **Endpoint**: `openapi.growatt.com/v1/`. Avoid the legacy `server-api.growatt.com` and the username/password path — both rate-limit aggressively and the latter has locked accounts in the past.
-- **SPH write call**: `update_mix_inverter_setting(serial, "mix_ac_charge_time_period", parameters)`. Sets the AC-charge time slots and the AC-charge enable bit in one transaction.
+- **SPH write call**: `OpenApiV1.sph_write_ac_charge_times(device_sn, charge_power, charge_stop_soc, mains_enabled, periods)`. `periods` is a list of three `{start_time, end_time, enabled}` dicts; we use period 1 for the live slot and disable periods 2 & 3.
 - **Approach**: at `cheap_now` rising edge, write an AC-charge slot covering `[now, now+15min]` with enable=true. Refresh the slot every ~10 min while still cheap (extends end time). At falling edge, write enable=false. The 15-min sliding-window pattern is so a crashed script can't leave the inverter in force-charge mode for hours — the inverter will fall out of AC-charge naturally within 15 min if our process dies.
 - **Standard 23:00–05:30 window**: same mechanism — the script owns this window too. The user's existing AC-charge schedule on the inverter will be cleared on first run (decided 2026-04-25); from then on every AC-charge slot is written by this service. This avoids two systems fighting over the slot.
 - **Fallback if cloud writes flake**: local Modbus to the ShineWiFi-X / ShineLAN-X dongle (TCP) or RS485. SPH register map for AC-charge: **1090** (start, encoded as `(hour<<8)|minute`), **1091** (stop), **1092** (enable). Reference: `0xAHA/Growatt_ModbusTCP` and `bobbesnl/ModbusGrowatt_HomeAssistant`.
@@ -68,13 +68,17 @@ Single Python service running in a long-lived loop:
 ┌─────────────────────────────────────────────────────────┐
 │  battery_automation/                                    │
 │    main.py                  ← orchestrator + edge logic │
+│    decision.py              ← pure cheap_now logic      │
 │    octopus.py               ← GraphQL plannedDispatches │
 │    hypervolt.py             ← Keycloak auth + WS client │
 │    growatt.py               ← growattServer wrapper     │
 │    config.py                ← secrets from env / .env   │
-│    state.py                 ← persists last-known edge  │
 └─────────────────────────────────────────────────────────┘
 ```
+
+No persistence layer: the service is idempotent on restart. The startup
+hook clears any pre-existing AC-charge schedule so the inverter state always
+starts from a known-disabled baseline.
 
 Loop cadence:
 - Octopus polled every 120s.
@@ -82,7 +86,7 @@ Loop cadence:
 - Decision recomputed every 60s and on any WS event.
 - Growatt write only on `cheap_now` edges, plus a 10-min keepalive while true.
 
-Logging: structured JSON to stdout. The user can pipe into journald/Docker logs.
+Logging: plain-text lines to stdout (`%(asctime)s %(levelname)s %(name)s %(message)s`). The user can pipe into journald/Docker logs. JSON was considered but the deployment target reads logs through `docker logs`, where structured fields don't add enough value to justify the extra dependency.
 
 Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs the Python service directly; no orchestrator needed. Secrets injected via env vars or a bind-mounted `.env`.
 

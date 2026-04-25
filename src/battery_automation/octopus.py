@@ -39,7 +39,7 @@ class Dispatch:
     location: str | None
 
     def covers(self, now: datetime) -> bool:
-        return self.start <= now <= self.end
+        return self.start <= now < self.end
 
 
 class OctopusClient:
@@ -72,32 +72,30 @@ class OctopusClient:
         log.info("octopus: obtained kraken token")
         return self._token
 
-    async def planned_dispatches(self) -> list[Dispatch]:
+    async def _post_authed(self, query: str, variables: dict) -> dict:
+        """POST a GraphQL query with the cached token; on 401, refresh once and retry."""
+        payload = {"query": query, "variables": variables}
         token = await self._ensure_token()
         r = await self._client.post(
-            GRAPHQL_URL,
-            headers={"Authorization": token},
-            json={
-                "query": PLANNED_DISPATCHES_QUERY,
-                "variables": {"input": self._account_number},
-            },
+            GRAPHQL_URL, headers={"Authorization": token}, json=payload
         )
         if r.status_code == 401:
             self._token = None
             token = await self._ensure_token()
             r = await self._client.post(
-                GRAPHQL_URL,
-                headers={"Authorization": token},
-                json={
-                    "query": PLANNED_DISPATCHES_QUERY,
-                    "variables": {"input": self._account_number},
-                },
+                GRAPHQL_URL, headers={"Authorization": token}, json=payload
             )
         r.raise_for_status()
         data = r.json()
         if "errors" in data:
-            raise RuntimeError(f"octopus dispatches error: {data['errors']}")
-        return [_parse_dispatch(d) for d in data["data"]["plannedDispatches"] or []]
+            raise RuntimeError(f"octopus query error: {data['errors']}")
+        return data["data"]
+
+    async def planned_dispatches(self) -> list[Dispatch]:
+        data = await self._post_authed(
+            PLANNED_DISPATCHES_QUERY, {"input": self._account_number}
+        )
+        return [_parse_dispatch(d) for d in data["plannedDispatches"] or []]
 
     async def active_dispatch(self, now: datetime | None = None) -> Dispatch | None:
         now = now or datetime.now(timezone.utc)
@@ -110,15 +108,9 @@ class OctopusClient:
 def _parse_dispatch(raw: dict) -> Dispatch:
     meta = raw.get("meta") or {}
     return Dispatch(
-        start=_parse_iso(raw["startDt"]),
-        end=_parse_iso(raw["endDt"]),
+        start=datetime.fromisoformat(raw["startDt"]),
+        end=datetime.fromisoformat(raw["endDt"]),
         delta=raw.get("delta"),
         source=meta.get("source"),
         location=meta.get("location"),
     )
-
-
-def _parse_iso(s: str) -> datetime:
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)

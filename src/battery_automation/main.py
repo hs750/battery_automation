@@ -15,25 +15,47 @@ log = logging.getLogger("battery_automation")
 
 
 class Service:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        octopus: OctopusClient,
+        hypervolt: HypervoltClient,
+        growatt: GrowattClient,
+    ) -> None:
         self._cfg = cfg
-        self._octopus = OctopusClient(cfg.octopus_api_key, cfg.octopus_account_number)
-        self._hypervolt = HypervoltClient(cfg.hypervolt_email, cfg.hypervolt_password)
-        self._growatt = GrowattClient(
-            cfg.growatt_api_token,
-            cfg.growatt_device_sn,
-            cfg.charge_power_percent,
-            cfg.charge_stop_soc,
-        )
+        self._octopus = octopus
+        self._hypervolt = hypervolt
+        self._growatt = growatt
         self._dispatches: list[Dispatch] = []
-        self._dispatches_at: datetime | None = None
         self._cheap_now: bool = False
         self._last_growatt_write: datetime | None = None
         self._stop = asyncio.Event()
 
+    @classmethod
+    def from_config(cls, cfg: Config) -> "Service":
+        return cls(
+            cfg,
+            OctopusClient(cfg.octopus_api_key, cfg.octopus_account_number),
+            HypervoltClient(cfg.hypervolt_email, cfg.hypervolt_password),
+            GrowattClient(
+                cfg.growatt_api_token,
+                cfg.growatt_device_sn,
+                cfg.charge_power_percent,
+                cfg.charge_stop_soc,
+            ),
+        )
+
     async def run(self) -> None:
         # Clear any pre-existing schedule on the inverter so this script owns it entirely.
-        await self._growatt.disable_ac_charge()
+        # Non-fatal: if the cloud is unreachable, the next falling edge will re-attempt.
+        try:
+            await self._growatt.disable_ac_charge()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "startup: failed to clear AC-charge schedule: %s; "
+                "continuing — will recover on next decision tick",
+                e,
+            )
 
         await self._hypervolt.start()
 
@@ -60,7 +82,6 @@ class Service:
         while not self._stop.is_set():
             try:
                 self._dispatches = await self._octopus.planned_dispatches()
-                self._dispatches_at = datetime.now(timezone.utc)
                 log.debug("octopus: %d planned dispatches", len(self._dispatches))
             except Exception as e:  # noqa: BLE001
                 log.warning("octopus: poll failed: %s", e)
@@ -81,8 +102,9 @@ class Service:
             except asyncio.TimeoutError:
                 pass
 
-    async def _evaluate_once(self) -> None:
-        now = datetime.now(timezone.utc)
+    async def _evaluate_once(self, now: datetime | None = None) -> None:
+        if now is None:
+            now = datetime.now(timezone.utc)
         in_dispatch = any(d.covers(now) for d in self._dispatches)
         hv_charging = self._hypervolt.is_charging()
         decision = decide(
@@ -140,7 +162,7 @@ def _setup_logging(level: str) -> None:
 async def _main() -> None:
     cfg = load_config()
     _setup_logging(cfg.log_level)
-    service = Service(cfg)
+    service = Service.from_config(cfg)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

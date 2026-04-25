@@ -22,7 +22,6 @@ KEYCLOAK_TOKEN_URL = (
 KEYCLOAK_CLIENT_ID = "home-assistant"
 USERS_ME_URL = "https://api.hypervolt.co.uk/users/me?includes=chargers"
 WS_SYNC_URL = "wss://api.hypervolt.co.uk/ws/charger/{charger_id}/sync"
-WS_SESSION_URL = "wss://api.hypervolt.co.uk/ws/charger/{charger_id}/session/in-progress"
 
 log = logging.getLogger(__name__)
 
@@ -108,16 +107,23 @@ class HypervoltClient:
 
     async def _run_forever(self) -> None:
         backoff = 3.0
+        needs_refresh = False
         while True:
+            if needs_refresh:
+                try:
+                    await self._refresh()
+                except (httpx.HTTPError, KeyError) as e:
+                    log.warning("hypervolt: token refresh failed: %s; will reconnect anyway", e)
             try:
                 await self._consume_ws()
                 backoff = 3.0
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # noqa: BLE001
+            except (websockets.WebSocketException, httpx.HTTPError, OSError) as e:
                 log.warning("hypervolt: ws error %s; reconnecting in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.7, 300.0)
+            needs_refresh = True
 
     async def _consume_ws(self) -> None:
         assert self._charger_id is not None
@@ -141,24 +147,31 @@ class HypervoltClient:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return
+        if isinstance(msg, dict) and "error" in msg:
+            log.debug("hypervolt: ws rpc error: %s", msg["error"])
+            return
         # Snapshots and applies arrive as JSON-RPC notifications/results; field
         # names of interest are at the top level of `params` or `result`.
         params = msg.get("params") or msg.get("result") or {}
         if not isinstance(params, dict):
             return
-        for key in ("release_state", "lock_state", "ct_power", "charging", "max_current"):
+        for key in ("ct_power", "charging", "max_current"):
             if key in params:
                 self._latest[key] = params[key]
         self._latest_at = time.time()
 
     def is_charging(self) -> bool | None:
-        """True if the charger is currently delivering power. None if state is stale/unknown."""
+        """True if the charger is currently delivering power. None if state is stale/unknown.
+
+        Primary signal: `ct_power` watts > 1000 (the threshold from DECISIONS.md).
+        Fallback: the boolean `charging` field from session-in-progress messages.
+        We deliberately do NOT consult `release_state` — it tracks user-cancellation
+        (RELEASED vs DEFAULT), not power delivery.
+        """
         if self._latest_at is None or time.time() - self._latest_at > 300:
             return None
         if "ct_power" in self._latest:
             return float(self._latest["ct_power"]) > 1000.0
         if "charging" in self._latest:
             return bool(self._latest["charging"])
-        if "release_state" in self._latest:
-            return str(self._latest["release_state"]).lower() in ("charging", "default")
         return None
