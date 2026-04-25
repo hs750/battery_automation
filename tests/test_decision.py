@@ -1,13 +1,8 @@
-from datetime import datetime, time, timezone
+from datetime import time
 
 import pytest
 
-from battery_automation.decision import LONDON, Inputs, decide, in_window
-
-
-def _ts(local_hhmm: str) -> datetime:
-    h, m = local_hhmm.split(":")
-    return datetime(2026, 4, 25, int(h), int(m), tzinfo=LONDON).astimezone(timezone.utc)
+from battery_automation.decision import Inputs, decide, in_window
 
 
 @pytest.mark.parametrize(
@@ -24,35 +19,27 @@ def test_in_window(now, start, end, expected):
     assert in_window(now, start, end) is expected
 
 
-def _inputs(local_hhmm: str, *, dispatch=False, hv=None) -> Inputs:
-    return Inputs(
-        now=_ts(local_hhmm),
-        cheap_window_start=time(23, 0),
-        cheap_window_end=time(5, 30),
-        in_planned_dispatch=dispatch,
-        hypervolt_charging=hv,
-    )
+def test_no_dispatch_no_charge():
+    assert decide(Inputs(in_planned_dispatch=False, hypervolt_charging=True)).cheap_now is False
 
 
-def test_standard_window_triggers():
-    assert decide(_inputs("00:30")).cheap_now is True
+def test_dispatch_without_ev_charging_no_charge():
+    d = decide(Inputs(in_planned_dispatch=True, hypervolt_charging=False))
+    assert d.cheap_now is False
+    assert "ev not charging" in d.reason
 
 
-def test_outside_window_no_signal():
-    assert decide(_inputs("18:00")).cheap_now is False
+def test_dispatch_with_unknown_ev_state_no_charge():
+    assert decide(Inputs(in_planned_dispatch=True, hypervolt_charging=None)).cheap_now is False
 
 
-def test_planned_dispatch_overrides():
-    d = decide(_inputs("14:00", dispatch=True))
+def test_dispatch_plus_ev_charging_charges():
+    d = decide(Inputs(in_planned_dispatch=True, hypervolt_charging=True))
     assert d.cheap_now is True
     assert "dispatch" in d.reason
 
 
-def test_hypervolt_only_in_plausible_window():
-    assert decide(_inputs("11:00", hv=True)).cheap_now is True
-    # Outside trust window — manual boost charge at peak rate, ignore.
-    assert decide(_inputs("19:00", hv=True)).cheap_now is False
-
-
-def test_hypervolt_unknown_doesnt_trigger():
-    assert decide(_inputs("11:00", hv=None)).cheap_now is False
+def test_ev_charging_without_dispatch_no_charge():
+    # No IOG signal — script ignores it; standard window (if any) is the inverter's
+    # problem via the permanent slot, not this decision function.
+    assert decide(Inputs(in_planned_dispatch=False, hypervolt_charging=True)).cheap_now is False

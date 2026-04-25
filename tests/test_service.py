@@ -86,6 +86,16 @@ def _at(local_hhmm: str) -> datetime:
     return datetime(2026, 4, 25, int(h), int(m), tzinfo=LONDON).astimezone(timezone.utc)
 
 
+def _dispatch(now: datetime, start_offset_min: int, end_offset_min: int) -> Dispatch:
+    return Dispatch(
+        start=now + timedelta(minutes=start_offset_min),
+        end=now + timedelta(minutes=end_offset_min),
+        delta=None,
+        source=None,
+        location=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_signal_no_writes():
     s = _service()
@@ -95,41 +105,51 @@ async def test_no_signal_no_writes():
 
 
 @pytest.mark.asyncio
-async def test_rising_edge_inside_standard_window_writes():
+async def test_standard_window_does_not_drive_dynamic_slot():
+    """The permanent slot (slot 1) owns 23:30–05:30; the script leaves slot 2 alone."""
     s = _service()
+    s._hypervolt.charging = True
     await s._evaluate_once(_at("00:30"))
-    assert s._cheap_now is True
-    assert len(s._growatt.calls) == 1
-    kind, start, end = s._growatt.calls[0]
-    assert kind == "set"
-    assert (end - start) == timedelta(seconds=900)
+    assert s._cheap_now is False
+    assert s._growatt.calls == []
 
 
 @pytest.mark.asyncio
 async def test_rising_edge_during_planned_dispatch_writes():
     s = _service()
+    s._hypervolt.charging = True
     now = _at("14:00")
-    s._dispatches = [
-        Dispatch(
-            start=now - timedelta(minutes=10),
-            end=now + timedelta(minutes=20),
-            delta=None,
-            source=None,
-            location=None,
-        )
-    ]
+    s._dispatches = [_dispatch(now, -10, 20)]
     await s._evaluate_once(now)
     assert s._cheap_now is True
     assert s._growatt.calls[0][0] == "set"
+    kind, start, end = s._growatt.calls[0]
+    assert (end - start) == timedelta(seconds=900)
+
+
+@pytest.mark.asyncio
+async def test_planned_dispatch_without_ev_charging_skips_dynamic_slot():
+    s = _service()
+    s._hypervolt.charging = False
+    now = _at("14:00")
+    s._dispatches = [_dispatch(now, -10, 20)]
+    await s._evaluate_once(now)
+    assert s._cheap_now is False
+    assert s._growatt.calls == []
 
 
 @pytest.mark.asyncio
 async def test_falling_edge_disables():
     s = _service()
-    await s._evaluate_once(_at("00:30"))
+    s._hypervolt.charging = True
+    t0 = _at("14:00")
+    s._dispatches = [_dispatch(t0, -5, 10)]
+
+    await s._evaluate_once(t0)
     assert s._cheap_now is True
 
-    await s._evaluate_once(_at("06:00"))
+    # Past the dispatch end — should fall.
+    await s._evaluate_once(t0 + timedelta(minutes=15))
     assert s._cheap_now is False
     assert s._growatt.calls[-1] == ("clear_dynamic",)
     assert s._last_growatt_write is None
@@ -138,7 +158,9 @@ async def test_falling_edge_disables():
 @pytest.mark.asyncio
 async def test_keepalive_only_after_interval():
     s = _service()
-    t0 = _at("00:30")
+    s._hypervolt.charging = True
+    t0 = _at("14:00")
+    s._dispatches = [_dispatch(t0, -5, 30)]
 
     await s._evaluate_once(t0)
     assert len(s._growatt.calls) == 1  # rising edge
@@ -156,16 +178,19 @@ async def test_keepalive_only_after_interval():
 @pytest.mark.asyncio
 async def test_failed_rising_write_self_heals_next_tick():
     s = _service()
+    s._hypervolt.charging = True
+    t0 = _at("14:00")
+    s._dispatches = [_dispatch(t0, -5, 30)]
     s._growatt.fail_next_set = True
 
-    await s._evaluate_once(_at("00:30"))
+    await s._evaluate_once(t0)
     # Write failed. cheap_now still becomes True so the next tick treats this
     # as the sustained branch and retries via the keepalive path.
     assert s._cheap_now is True
     assert s._last_growatt_write is None
     assert s._growatt.calls == []
 
-    await s._evaluate_once(_at("00:31"))
+    await s._evaluate_once(t0 + timedelta(minutes=1))
     assert any(c[0] == "set" for c in s._growatt.calls)
     assert s._last_growatt_write is not None
 
@@ -173,32 +198,65 @@ async def test_failed_rising_write_self_heals_next_tick():
 @pytest.mark.asyncio
 async def test_failed_falling_clear_does_not_clear_state():
     s = _service()
-    await s._evaluate_once(_at("00:30"))
+    s._hypervolt.charging = True
+    t0 = _at("14:00")
+    s._dispatches = [_dispatch(t0, -5, 10)]
+
+    await s._evaluate_once(t0)
     assert s._cheap_now is True
 
     s._growatt.fail_next_clear = True
-    await s._evaluate_once(_at("06:00"))
+    await s._evaluate_once(t0 + timedelta(minutes=15))  # dispatch over
     # Clear failed: cheap_now stays True so next tick will retry the clear.
     assert s._cheap_now is True
 
-    await s._evaluate_once(_at("06:01"))
+    await s._evaluate_once(t0 + timedelta(minutes=16))
     assert s._cheap_now is False
     assert s._growatt.calls[-1] == ("clear_dynamic",)
 
 
 @pytest.mark.asyncio
-async def test_hypervolt_signal_only_in_trust_window():
+async def test_logs_dispatch_without_ev_mismatch(caplog):
+    s = _service()
+    s._hypervolt.charging = False
+    now = _at("14:00")
+    s._dispatches = [_dispatch(now, -5, 30)]
+    with caplog.at_level("INFO", logger="battery_automation"):
+        await s._evaluate_once(now)
+        assert any(
+            "iog planned dispatch active but ev not charging" in r.message
+            for r in caplog.records
+        )
+        caplog.clear()
+
+        # Same state on the next tick — no duplicate log.
+        await s._evaluate_once(now + timedelta(minutes=1))
+        assert not any("mismatch" in r.message for r in caplog.records)
+
+        # EV starts charging — mismatch resolved.
+        s._hypervolt.charging = True
+        await s._evaluate_once(now + timedelta(minutes=2))
+        assert any("mismatch resolved" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_standard_window_without_ev_is_not_a_mismatch(caplog):
+    """Overnight without the EV plugged in is the normal case, not a mismatch."""
+    s = _service()
+    s._hypervolt.charging = False
+    with caplog.at_level("INFO", logger="battery_automation"):
+        await s._evaluate_once(_at("00:30"))
+        assert not any("mismatch" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_logs_peak_rate_boost_mismatch(caplog):
     s = _service()
     s._hypervolt.charging = True
-
-    # 11:00 — inside the 09:00–16:00 trust window
-    await s._evaluate_once(_at("11:00"))
-    assert s._cheap_now is True
-    s._growatt.calls.clear()
-    s._cheap_now = False  # reset for next case
-    s._last_growatt_write = None
-
-    # 19:00 — outside trust window; manual boost charge ignored
-    await s._evaluate_once(_at("19:00"))
-    assert s._cheap_now is False
-    assert s._growatt.calls == []
+    with caplog.at_level("WARNING", logger="battery_automation"):
+        # 19:00, EV charging, no IOG cheap signal — manual peak-rate boost.
+        await s._evaluate_once(_at("19:00"))
+        assert any(
+            "peak-rate boost" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )

@@ -6,7 +6,7 @@ import signal
 from datetime import datetime, timedelta, timezone
 
 from .config import Config, load_config
-from .decision import Inputs, decide
+from .decision import LONDON, Inputs, decide, in_window
 from .growatt import GrowattClient, slot_for_now
 from .hypervolt import HypervoltClient
 from .octopus import Dispatch, OctopusClient
@@ -29,6 +29,7 @@ class Service:
         self._dispatches: list[Dispatch] = []
         self._cheap_now: bool = False
         self._last_growatt_write: datetime | None = None
+        self._last_mismatch: str | None = None
         self._stop = asyncio.Event()
 
     @classmethod
@@ -111,16 +112,11 @@ class Service:
         if now is None:
             now = datetime.now(timezone.utc)
         in_dispatch = any(d.covers(now) for d in self._dispatches)
-        hv_charging = self._hypervolt.is_charging()
+        ev_charging = self._hypervolt.is_charging()
         decision = decide(
-            Inputs(
-                now=now,
-                cheap_window_start=self._cfg.cheap_window_start,
-                cheap_window_end=self._cfg.cheap_window_end,
-                in_planned_dispatch=in_dispatch,
-                hypervolt_charging=hv_charging,
-            )
+            Inputs(in_planned_dispatch=in_dispatch, hypervolt_charging=ev_charging)
         )
+        self._log_signal_mismatch(now, in_dispatch, ev_charging)
 
         if decision.cheap_now and not self._cheap_now:
             log.info("cheap_now → True (%s)", decision.reason)
@@ -138,6 +134,40 @@ class Service:
                 return
             self._last_growatt_write = None
         self._cheap_now = decision.cheap_now
+
+    def _log_signal_mismatch(
+        self, now: datetime, in_dispatch: bool, ev_charging: bool | None
+    ) -> None:
+        """Edge-trigger a log when the IOG dispatch and EV signals disagree.
+
+        Skipped while EV state is unknown. The standard overnight window is not
+        a "mismatch" case under our model — we charge overnight regardless of
+        whether the car is plugged in — so it's deliberately not flagged here.
+        """
+        if ev_charging is None:
+            return
+        in_standard = in_window(
+            now.astimezone(LONDON).time(),
+            self._cfg.cheap_window_start,
+            self._cfg.cheap_window_end,
+        )
+        if in_dispatch and not ev_charging:
+            current = "iog_dispatch_no_ev"
+        elif ev_charging and not in_dispatch and not in_standard:
+            current = "ev_no_iog"
+        else:
+            current = None
+        if current == self._last_mismatch:
+            return
+        if current == "iog_dispatch_no_ev":
+            log.info("signal mismatch: iog planned dispatch active but ev not charging")
+        elif current == "ev_no_iog":
+            log.warning(
+                "signal mismatch: ev charging outside iog cheap period (peak-rate boost?)"
+            )
+        elif self._last_mismatch is not None:
+            log.info("signal mismatch resolved (was %s)", self._last_mismatch)
+        self._last_mismatch = current
 
     def _needs_keepalive(self, now: datetime) -> bool:
         if self._last_growatt_write is None:
