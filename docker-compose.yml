@@ -1,0 +1,14 @@
+services:
+  battery-automation:
+    build: .
+    image: battery-automation:latest
+    container_name: battery-automation
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Europe/London
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
