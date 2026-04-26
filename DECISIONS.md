@@ -1,6 +1,6 @@
 # Battery Automation — Decisions & Knowledge
 
-Last updated: 2026-04-25
+Last updated: 2026-04-26
 
 ## Goal
 
@@ -50,7 +50,7 @@ Re-evaluate every 60s. The script writes to the inverter only on **edges** (fals
 - **Home 3 Pro**: fully supported, including V3-only fields (car-plugged-in flag, session charge mode).
 - **Resilience**: WS can drop; reconnect with exponential backoff and a 60s REST fallback poll on the same auth.
 
-### Growatt SPH3000 — primary: `growattServer` v2.1.0; fallback: local Modbus
+### Growatt SPH3000 — primary: `growattServer` v2.1.0 (Modbus fallback deferred, see below)
 
 - **Library**: `growattServer` 2.1.0 on PyPI (<https://github.com/indykoning/PyPi_GrowattServer>, last release 2026-04-16). Active.
 - **Auth**: API token from ShinePhone app → Me → API Token (or `openapi.growatt.com` web UI → Account Management). One-time setup; user must request the token in-app.
@@ -58,7 +58,7 @@ Re-evaluate every 60s. The script writes to the inverter only on **edges** (fals
 - **SPH write call**: `OpenApiV1.sph_write_ac_charge_times(device_sn, charge_power, charge_stop_soc, mains_enabled, periods)`. `periods` is a list of three `{start_time, end_time, enabled}` dicts; we use period 1 for the live slot and disable periods 2 & 3.
 - **Approach**: at `cheap_now` rising edge, write an AC-charge slot covering `[now, now+15min]` with enable=true. Refresh the slot every ~10 min while still cheap (extends end time). At falling edge, write enable=false. The 15-min sliding-window pattern is so a crashed script can't leave the inverter in force-charge mode for hours — the inverter will fall out of AC-charge naturally within 15 min if our process dies.
 - **Standard 23:00–05:30 window**: same mechanism — the script owns this window too. The user's existing AC-charge schedule on the inverter will be cleared on first run (decided 2026-04-25); from then on every AC-charge slot is written by this service. This avoids two systems fighting over the slot.
-- **Fallback if cloud writes flake**: local Modbus to the ShineWiFi-X / ShineLAN-X dongle (TCP) or RS485. SPH register map for AC-charge: **1090** (start, encoded as `(hour<<8)|minute`), **1091** (stop), **1092** (enable). Reference: `0xAHA/Growatt_ModbusTCP` and `bobbesnl/ModbusGrowatt_HomeAssistant`.
+- **Fallback if cloud writes flake**: *deferred — not implemented (2026-04-26)*. See "Modbus fallback (deferred)" below for what this would buy us and what it'd take to add later.
 
 ## Architecture (proposed)
 
@@ -117,7 +117,34 @@ Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs
 
 1. **Stale force-charge state.** If the script crashes mid-dispatch, the inverter could stay in AC-charge into peak rate. Mitigation: short sliding-window writes (15 min) that auto-expire, plus a watchdog that clears the schedule on startup.
 2. **Octopus API misses a dispatch.** Hypervolt power-draw fallback covers this, but introduces a small risk of force-charging during a *manual* boost charge (user pays peak rate twice). Mitigation: only trust the Hypervolt-only signal during plausible dispatch hours, never 17:00–22:00 when the user might genuinely boost-charge at peak rate.
-3. **Growatt cloud write flakiness.** Open HA regression on `write_ac_charge_times` (home-assistant/core#166817, Mar 2026). We're not using HA, so we sidestep it, but the underlying API still wobbles. Local Modbus is the parachute.
+3. **Growatt cloud write flakiness.** Open HA regression on `write_ac_charge_times` (home-assistant/core#166817, Mar 2026). We're not using HA, so we sidestep it, but the underlying API still wobbles. No parachute today (Modbus fallback deferred — see below); a sustained Growatt cloud outage means no dynamic AC-charge writes. The permanent slot 1 keeps honoring the nightly window regardless.
+
+## Deferred work
+
+### Modbus fallback for Growatt (deferred 2026-04-26)
+
+**What it is.** Modbus is a 1970s industrial protocol that nearly every solar inverter still speaks natively. The SPH3000 exposes the AC-charge controls as numeric "holding registers" (specifically **1090** = slot start time, **1091** = slot end time, **1092** = enable flag — encoded as `(hour<<8)|minute` for the time fields). Two ways to reach those registers:
+
+- **Modbus TCP** over the LAN, via the ShineWiFi-X / ShineLAN-X dongle on port 502. May be open or closed depending on dongle firmware (worth running `nmap -p 502 <dongle-ip>` before committing to the implementation).
+- **Modbus RTU** over RS-485, with a USB-to-RS485 adapter (~£10) wired to the inverter's COM port.
+
+Either path talks to the inverter directly with no dependency on Growatt's cloud, ShineServer, or our internet uplink.
+
+**Why we'd want it.** Today the only path is `script → Growatt cloud → ShineServer → dongle → inverter`. Adding Modbus would buy us:
+
+1. **Cloud-independent fallback.** Sustained Growatt cloud outages currently mean no dynamic AC-charge writes (the permanent slot 1 still fires nightly). A local path keeps the dynamic slot working through cloud outages.
+2. **Read-back verification.** We could poll registers to confirm a write actually took effect, instead of trusting that a 200-OK from the cloud means the inverter obeyed. The current write-only design can't catch silent write failures.
+3. **Latency and quotas.** Local writes are milliseconds and have no rate limit; the cloud round-trip is multi-second and quota-bounded.
+4. **Resilience to Growatt token expiry / API breaking changes.**
+
+**Why we deferred it.** The cloud path has been holding up; this is meaningful work for an unrealised problem. Specifically, deferring avoids:
+
+- Adding `pymodbus` and a parallel control path that needs its own tests.
+- Relying on a community-reverse-engineered register map (Growatt doesn't officially publish registers) — wrong-register risk against a battery is non-zero.
+- Designing the fallback orchestration (try cloud first then local? always-local? health-check-driven failover?).
+- Possibly buying and wiring an RS-485 adapter if the dongle's port 502 turns out to be closed.
+
+**Trigger to revisit.** Any of: a Growatt cloud outage that prevents a planned dispatch from charging the battery; evidence (from logs / inverter state read-back when added) that cloud writes are silently dropping; or a Growatt API breaking change. References: [`0xAHA/Growatt_ModbusTCP`](https://github.com/0xAHA/Growatt_ModbusTCP), [`bobbesnl/ModbusGrowatt_HomeAssistant`](https://github.com/bobbesnl/ModbusGrowatt_HomeAssistant) (SPH register map 1090/1091/1092).
 
 ## Sources (verified during research)
 

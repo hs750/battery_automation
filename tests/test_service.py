@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,7 @@ def _cfg(**overrides) -> Config:
         decision_interval_seconds=60,
         growatt_keepalive_seconds=600,
         growatt_slot_length_seconds=900,
+        hypervolt_stale_seconds=300,
     )
     base.update(overrides)
     return Config(**base)
@@ -35,23 +37,26 @@ def _cfg(**overrides) -> Config:
 class FakeOctopus:
     def __init__(self):
         self.dispatches: list[Dispatch] = []
+        self.closed = False
 
     async def planned_dispatches(self):
         return self.dispatches
 
     async def aclose(self):
-        pass
+        self.closed = True
 
 
 class FakeHypervolt:
     def __init__(self):
         self.charging: bool | None = None
+        self.started = False
+        self.closed = False
 
     async def start(self):
-        pass
+        self.started = True
 
     async def aclose(self):
-        pass
+        self.closed = True
 
     def is_charging(self):
         return self.charging
@@ -176,7 +181,7 @@ async def test_keepalive_only_after_interval():
 
 
 @pytest.mark.asyncio
-async def test_failed_rising_write_self_heals_next_tick():
+async def test_failed_rising_write_retries_as_rising_edge_next_tick():
     s = _service()
     s._hypervolt.charging = True
     t0 = _at("14:00")
@@ -184,13 +189,15 @@ async def test_failed_rising_write_self_heals_next_tick():
     s._growatt.fail_next_set = True
 
     await s._evaluate_once(t0)
-    # Write failed. cheap_now still becomes True so the next tick treats this
-    # as the sustained branch and retries via the keepalive path.
-    assert s._cheap_now is True
+    # Write failed: cheap_now stays False so the next tick is a fresh rising
+    # edge rather than a sustained-high keepalive (symmetric with falling-edge
+    # behavior on clear failure).
+    assert s._cheap_now is False
     assert s._last_growatt_write is None
     assert s._growatt.calls == []
 
     await s._evaluate_once(t0 + timedelta(minutes=1))
+    assert s._cheap_now is True
     assert any(c[0] == "set" for c in s._growatt.calls)
     assert s._last_growatt_write is not None
 
@@ -260,3 +267,51 @@ async def test_logs_peak_rate_boost_mismatch(caplog):
             "peak-rate boost" in r.message and r.levelname == "WARNING"
             for r in caplog.records
         )
+
+
+@pytest.mark.asyncio
+async def test_request_stop_shuts_down_cleanly():
+    # Tight intervals so the loops don't keep us waiting after stop fires.
+    s = Service(
+        _cfg(decision_interval_seconds=1, octopus_poll_seconds=1),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+
+    run_task = asyncio.create_task(s.run())
+    # Let the startup phase complete so clear_dynamic_window has been called
+    # and the loops have spun up.
+    await asyncio.sleep(0.1)
+
+    s.request_stop()
+    await asyncio.wait_for(run_task, timeout=2.0)
+
+    # Clear called once on startup + once on shutdown.
+    clears = [c for c in s._growatt.calls if c == ("clear_dynamic",)]
+    assert len(clears) == 2
+    # Clients closed.
+    assert s._hypervolt.closed is True
+    assert s._octopus.closed is True
+    assert s._hypervolt.started is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_clears_dynamic_slot_even_when_startup_clear_failed():
+    fake_growatt = FakeGrowatt()
+    fake_growatt.fail_next_clear = True  # startup clear will fail
+    s = Service(
+        _cfg(decision_interval_seconds=1, octopus_poll_seconds=1),
+        FakeOctopus(),
+        FakeHypervolt(),
+        fake_growatt,
+    )
+
+    run_task = asyncio.create_task(s.run())
+    await asyncio.sleep(0.1)
+    s.request_stop()
+    await asyncio.wait_for(run_task, timeout=2.0)
+
+    # Startup clear raised (and was swallowed), so calls only contains the
+    # shutdown clear.
+    assert ("clear_dynamic",) in s._growatt.calls

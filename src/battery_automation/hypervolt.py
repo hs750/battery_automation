@@ -29,15 +29,23 @@ log = logging.getLogger(__name__)
 class HypervoltClient:
     """Tracks live charging state. State is `None` until the first WS message arrives."""
 
-    def __init__(self, email: str, password: str) -> None:
+    def __init__(self, email: str, password: str, stale_seconds: int = 300) -> None:
         self._email = email
         self._password = password
+        self._stale_seconds = stale_seconds
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._http = httpx.AsyncClient(timeout=15.0)
         self._charger_id: str | None = None
         self._latest: dict[str, Any] = {}
+        # _latest_at: last time we extracted a *recognized* field. Drives the
+        # stale-state check so an upstream rename of `ct_power` surfaces as
+        # "unknown" (None) rather than a frozen reading.
         self._latest_at: float | None = None
+        # _last_message_at: last time any message parsed successfully. Combined
+        # with _latest_at this lets us detect "WS is alive but the schema drifted".
+        self._last_message_at: float | None = None
+        self._drift_warned: bool = False
         self._task: asyncio.Task | None = None
 
     async def aclose(self) -> None:
@@ -123,10 +131,14 @@ class HypervoltClient:
                 log.warning("hypervolt: ws error %s; reconnecting in %.0fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.7, 300.0)
+            # Reset drift state on reconnect — a fresh session may speak a
+            # different shape, and the warning was about the old session.
+            self._drift_warned = False
             needs_refresh = True
 
     async def _consume_ws(self) -> None:
-        assert self._charger_id is not None
+        if self._charger_id is None:
+            raise RuntimeError("hypervolt: _consume_ws called before charger discovery")
         url = WS_SYNC_URL.format(charger_id=self._charger_id)
         async with websockets.connect(url, ping_interval=30, ping_timeout=10) as ws:
             await ws.send(
@@ -147,6 +159,7 @@ class HypervoltClient:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return
+        self._last_message_at = time.time()
         if isinstance(msg, dict) and "error" in msg:
             log.debug("hypervolt: ws rpc error: %s", msg["error"])
             return
@@ -155,10 +168,14 @@ class HypervoltClient:
         params = msg.get("params") or msg.get("result") or {}
         if not isinstance(params, dict):
             return
+        recognized = False
         for key in ("ct_power", "charging", "max_current"):
             if key in params:
                 self._latest[key] = params[key]
-        self._latest_at = time.time()
+                recognized = True
+        if recognized:
+            self._latest_at = self._last_message_at
+            self._drift_warned = False
 
     def is_charging(self) -> bool | None:
         """True if the charger is currently delivering power. None if state is stale/unknown.
@@ -168,10 +185,30 @@ class HypervoltClient:
         We deliberately do NOT consult `release_state` — it tracks user-cancellation
         (RELEASED vs DEFAULT), not power delivery.
         """
-        if self._latest_at is None or time.time() - self._latest_at > 300:
+        now = time.time()
+        if self._latest_at is None or now - self._latest_at > self._stale_seconds:
+            self._maybe_warn_drift(now)
             return None
         if "ct_power" in self._latest:
             return float(self._latest["ct_power"]) > 1000.0
         if "charging" in self._latest:
             return bool(self._latest["charging"])
         return None
+
+    def _maybe_warn_drift(self, now: float) -> None:
+        # WS is delivering messages but none carry recognized fields — likely an
+        # upstream schema rename. Warn once per drift episode (cleared on
+        # reconnect or when a recognized field arrives).
+        if self._drift_warned:
+            return
+        if self._last_message_at is None:
+            return
+        msg_age = now - self._last_message_at
+        latest_age = now - self._latest_at if self._latest_at is not None else None
+        if msg_age <= self._stale_seconds and (latest_age is None or latest_age > self._stale_seconds):
+            log.warning(
+                "hypervolt: ws receiving messages but no recognized state in "
+                "%s; api drift?",
+                f"{int(latest_age)}s" if latest_age is not None else "any so far",
+            )
+            self._drift_warned = True

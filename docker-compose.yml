@@ -7,6 +7,14 @@ services:
     env_file: .env
     environment:
       TZ: Europe/London
+    healthcheck:
+      # Decision loop touches /tmp/battery-automation-alive every tick (60s default).
+      # Mark unhealthy if the file hasn't been touched in 3 minutes (deadlock detector).
+      test: ["CMD-SHELL", "find /tmp/battery-automation-alive -mmin -3 | grep -q ."]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     logging:
       driver: json-file
       options:

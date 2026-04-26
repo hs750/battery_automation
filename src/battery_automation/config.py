@@ -9,14 +9,39 @@ LONDON = ZoneInfo("Europe/London")
 
 
 def _parse_hhmm(s: str) -> time:
-    h, m = s.split(":")
-    return time(int(h), int(m))
+    try:
+        h, m = s.strip().split(":")
+        return time(int(h), int(m))
+    except (ValueError, AttributeError) as e:
+        raise RuntimeError(f"invalid HH:MM time {s!r}: {e}") from e
 
 
 def _required(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         raise RuntimeError(f"missing required env var: {name}")
+    return v
+
+
+def _percent(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        v = int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name}={raw!r} is not an integer") from e
+    if not 0 <= v <= 100:
+        raise RuntimeError(f"{name}={v} out of range (must be 0..100)")
+    return v
+
+
+def _positive_int(name: str, default: str) -> int:
+    raw = os.environ.get(name, default)
+    try:
+        v = int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"{name}={raw!r} is not an integer") from e
+    if v <= 0:
+        raise RuntimeError(f"{name}={v} must be > 0")
     return v
 
 
@@ -42,6 +67,7 @@ class Config:
     decision_interval_seconds: int
     growatt_keepalive_seconds: int
     growatt_slot_length_seconds: int
+    hypervolt_stale_seconds: int
 
 
 def load_config() -> Config:
@@ -55,11 +81,12 @@ def load_config() -> Config:
         growatt_device_sn=_required("GROWATT_DEVICE_SN"),
         cheap_window_start=_parse_hhmm(os.environ.get("CHEAP_WINDOW_START", "23:30")),
         cheap_window_end=_parse_hhmm(os.environ.get("CHEAP_WINDOW_END", "05:30")),
-        charge_power_percent=int(os.environ.get("CHARGE_POWER_PERCENT", "100")),
-        charge_stop_soc=int(os.environ.get("CHARGE_STOP_SOC", "100")),
+        charge_power_percent=_percent("CHARGE_POWER_PERCENT", "100"),
+        charge_stop_soc=_percent("CHARGE_STOP_SOC", "100"),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
-        octopus_poll_seconds=int(os.environ.get("OCTOPUS_POLL_SECONDS", "120")),
-        decision_interval_seconds=int(os.environ.get("DECISION_INTERVAL_SECONDS", "60")),
-        growatt_keepalive_seconds=int(os.environ.get("GROWATT_KEEPALIVE_SECONDS", "600")),
-        growatt_slot_length_seconds=int(os.environ.get("GROWATT_SLOT_LENGTH_SECONDS", "900")),
+        octopus_poll_seconds=_positive_int("OCTOPUS_POLL_SECONDS", "120"),
+        decision_interval_seconds=_positive_int("DECISION_INTERVAL_SECONDS", "60"),
+        growatt_keepalive_seconds=_positive_int("GROWATT_KEEPALIVE_SECONDS", "600"),
+        growatt_slot_length_seconds=_positive_int("GROWATT_SLOT_LENGTH_SECONDS", "900"),
+        hypervolt_stale_seconds=_positive_int("HYPERVOLT_STALE_SECONDS", "300"),
     )
