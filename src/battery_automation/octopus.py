@@ -73,13 +73,21 @@ class OctopusClient:
         return self._token
 
     async def _post_authed(self, query: str, variables: dict) -> dict:
-        """POST a GraphQL query with the cached token; on 401, refresh once and retry."""
+        """POST a GraphQL query with the cached token; on auth failure, refresh once and retry.
+
+        Kraken signals expiry two ways: HTTP 401, or HTTP 200 with a GraphQL error
+        carrying errorCode KT-CT-1124 ("Signature of the JWT has expired").
+        """
         payload = {"query": query, "variables": variables}
         token = await self._ensure_token()
         r = await self._client.post(
             GRAPHQL_URL, headers={"Authorization": token}, json=payload
         )
-        if r.status_code == 401:
+        refresh = r.status_code == 401 or (
+            r.status_code == 200
+            and _is_expired_token_error(r.json().get("errors") or [])
+        )
+        if refresh:
             self._token = None
             token = await self._ensure_token()
             r = await self._client.post(
@@ -103,6 +111,13 @@ class OctopusClient:
             if d.covers(now):
                 return d
         return None
+
+
+def _is_expired_token_error(errors: list[dict]) -> bool:
+    for err in errors:
+        if (err.get("extensions") or {}).get("errorCode") == "KT-CT-1124":
+            return True
+    return False
 
 
 def _parse_dispatch(raw: dict) -> Dispatch:
