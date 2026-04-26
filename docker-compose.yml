@@ -1,9 +1,21 @@
+# Deploy flow on the NAS:
+#   1. git pull
+#   2. In Dockge, click "Update" on this stack (runs `compose up -d --build`).
+#      A plain "Restart" only restarts the container — it does NOT rebuild.
+# .env lives next to this file on the host and is read by Compose at deploy
+# time; it is never copied into the image.
+
 services:
   battery-automation:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: battery-automation:latest
+    pull_policy: build  # never try to pull from a registry; this image is local-only
     container_name: battery-automation
     restart: unless-stopped
+    init: true  # PID 1 = tini, so SIGTERM reaches python and asyncio shuts down cleanly
+    stop_grace_period: 30s
     env_file: .env
     environment:
       TZ: Europe/London

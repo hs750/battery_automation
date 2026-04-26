@@ -1,8 +1,8 @@
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TZ=Europe/London
 
@@ -12,8 +12,11 @@ WORKDIR /app
 # Install dependencies first so source-only changes don't invalidate the dep layer.
 # We materialise an empty package skeleton so `pip install .` can resolve the
 # project metadata, then discard it before copying the real source.
+# BuildKit cache mount keeps pip's wheel cache between rebuilds — important on
+# a NAS where rebuilds happen on every code update.
 COPY pyproject.toml ./
-RUN mkdir -p src/battery_automation && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    mkdir -p src/battery_automation && \
     : > src/battery_automation/__init__.py && \
     pip install . && \
     rm -rf src
