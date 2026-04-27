@@ -131,3 +131,68 @@ async def test_error_message_does_not_update_state(client, monkeypatch):
     # _last_message_at advances (we did parse it) but _latest_at must not.
     assert client._last_message_at == 1000.0
     assert client._latest_at is None
+
+
+async def test_pilot_status_a_means_unplugged(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="A"))
+    assert client.is_plugged_in() is False
+
+
+async def test_pilot_status_b_means_plugged(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="B"))
+    assert client.is_plugged_in() is True
+
+
+async def test_pilot_status_c_means_plugged(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="C"))
+    assert client.is_plugged_in() is True
+
+
+async def test_is_plugged_in_unknown_when_no_pilot_status(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(ct_power=1500))
+    assert client.is_plugged_in() is None
+
+
+async def test_is_plugged_in_stale_returns_none(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="B"))
+    monkeypatch.setattr(time_module, "time", lambda: 1400.0)
+    assert client.is_plugged_in() is None
+
+
+async def test_plugged_in_event_fires_on_a_to_b_transition(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="A"))
+    assert not client.plugged_in_event.is_set()
+    client._on_message(_msg(pilot_status="B"))
+    assert client.plugged_in_event.is_set()
+
+
+async def test_plugged_in_event_does_not_fire_on_b_to_c(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="B"))
+    client.plugged_in_event.clear()
+    client._on_message(_msg(pilot_status="C"))
+    assert not client.plugged_in_event.is_set()
+
+
+async def test_plugged_in_event_does_not_fire_on_unplug(client, monkeypatch):
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="C"))
+    client.plugged_in_event.clear()
+    client._on_message(_msg(pilot_status="A"))
+    assert not client.plugged_in_event.is_set()
+
+
+async def test_plugged_in_event_fires_when_first_message_is_already_plugged(
+    client, monkeypatch
+):
+    """Startup case: first message we ever see is `B`. Treat unknown→plugged as
+    a plug-in transition so the octopus loop wakes immediately on cold start."""
+    monkeypatch.setattr(time_module, "time", lambda: 1000.0)
+    client._on_message(_msg(pilot_status="B"))
+    assert client.plugged_in_event.is_set()

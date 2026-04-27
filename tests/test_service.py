@@ -38,8 +38,10 @@ class FakeOctopus:
     def __init__(self):
         self.dispatches: list[Dispatch] = []
         self.closed = False
+        self.poll_count = 0
 
     async def planned_dispatches(self):
+        self.poll_count += 1
         return self.dispatches
 
     async def aclose(self):
@@ -49,8 +51,10 @@ class FakeOctopus:
 class FakeHypervolt:
     def __init__(self):
         self.charging: bool | None = None
+        self.plugged: bool | None = None
         self.started = False
         self.closed = False
+        self.plugged_in_event = asyncio.Event()
 
     async def start(self):
         self.started = True
@@ -60,6 +64,9 @@ class FakeHypervolt:
 
     def is_charging(self):
         return self.charging
+
+    def is_plugged_in(self):
+        return self.plugged
 
 
 class FakeGrowatt:
@@ -294,6 +301,109 @@ async def test_request_stop_shuts_down_cleanly():
     assert s._hypervolt.closed is True
     assert s._octopus.closed is True
     assert s._hypervolt.started is True
+
+
+@pytest.mark.asyncio
+async def test_octopus_loop_skips_poll_when_unplugged():
+    s = Service(
+        _cfg(decision_interval_seconds=10, octopus_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+    s._hypervolt.plugged = False
+
+    loop_task = asyncio.create_task(s._octopus_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert s._octopus.poll_count == 0
+
+
+@pytest.mark.asyncio
+async def test_octopus_loop_clears_cached_dispatches_on_unplug():
+    s = Service(
+        _cfg(decision_interval_seconds=10, octopus_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+    # Seed a cached dispatch from a previous plugged-in period.
+    s._dispatches = [_dispatch(_at("14:00"), -5, 30)]
+    s._hypervolt.plugged = False
+
+    loop_task = asyncio.create_task(s._octopus_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert s._dispatches == []
+
+
+@pytest.mark.asyncio
+async def test_octopus_loop_polls_when_plugged_in():
+    s = Service(
+        _cfg(decision_interval_seconds=10, octopus_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+    s._hypervolt.plugged = True
+
+    loop_task = asyncio.create_task(s._octopus_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert s._octopus.poll_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_octopus_loop_polls_when_plug_state_unknown():
+    """V2 chargers / cold start: pilot_status missing → fail-safe and poll."""
+    s = Service(
+        _cfg(decision_interval_seconds=10, octopus_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+    s._hypervolt.plugged = None
+
+    loop_task = asyncio.create_task(s._octopus_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(loop_task, timeout=1.0)
+
+    assert s._octopus.poll_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_plug_in_event_wakes_octopus_loop_early():
+    # Long poll interval so we'd block far past the test timeout if the event
+    # didn't wake us.
+    s = Service(
+        _cfg(decision_interval_seconds=60, octopus_poll_seconds=600),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+    )
+    s._hypervolt.plugged = False
+
+    loop_task = asyncio.create_task(s._octopus_loop())
+    # First iteration: unplugged, no poll, then sleeping on the event.
+    await asyncio.sleep(0.05)
+    assert s._octopus.poll_count == 0
+
+    # Plug in.
+    s._hypervolt.plugged = True
+    s._hypervolt.plugged_in_event.set()
+    await asyncio.sleep(0.05)
+    # The loop should have woken, polled once, and gone back to waiting.
+    assert s._octopus.poll_count >= 1
+
+    s.request_stop()
+    await asyncio.wait_for(loop_task, timeout=1.0)
 
 
 @pytest.mark.asyncio

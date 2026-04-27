@@ -98,17 +98,47 @@ class Service:
 
     async def _octopus_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                self._dispatches = await self._octopus.planned_dispatches()
-                log.debug("octopus: %d planned dispatches", len(self._dispatches))
-            except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as e:
-                log.warning("octopus: poll failed: %s", e)
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(), timeout=self._cfg.octopus_poll_seconds
-                )
-            except asyncio.TimeoutError:
-                pass
+            # Clear before checking so a plug-in arriving *during* this iteration
+            # is observed by the next .wait() rather than being lost.
+            self._hypervolt.plugged_in_event.clear()
+            plugged = self._hypervolt.is_plugged_in()
+            if plugged is False:
+                # Car is unplugged — IOG won't schedule dispatches. Drop any
+                # cached entries so a stale in-window dispatch can't drive a
+                # write after unplug.
+                if self._dispatches:
+                    log.debug("octopus: car unplugged, clearing %d cached dispatches",
+                              len(self._dispatches))
+                    self._dispatches = []
+            else:
+                # Plugged in (True) or unknown (None) — poll. Treating unknown
+                # as a poll keeps us safe on V2 chargers that don't report
+                # pilot_status, and on cold start before the WS warms up.
+                try:
+                    self._dispatches = await self._octopus.planned_dispatches()
+                    log.debug("octopus: %d planned dispatches", len(self._dispatches))
+                except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as e:
+                    log.warning("octopus: poll failed: %s", e)
+            await self._wait_octopus_interval()
+
+    async def _wait_octopus_interval(self) -> None:
+        """Sleep until the next poll, but wake early on stop or plug-in."""
+        stop_task = asyncio.create_task(self._stop.wait())
+        plug_task = asyncio.create_task(self._hypervolt.plugged_in_event.wait())
+        try:
+            await asyncio.wait(
+                {stop_task, plug_task},
+                timeout=self._cfg.octopus_poll_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for t in (stop_task, plug_task):
+                if not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
 
     async def _decision_loop(self) -> None:
         while not self._stop.is_set():

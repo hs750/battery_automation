@@ -23,6 +23,11 @@ KEYCLOAK_CLIENT_ID = "home-assistant"
 USERS_ME_URL = "https://api.hypervolt.co.uk/users/me?includes=chargers"
 WS_SYNC_URL = "wss://api.hypervolt.co.uk/ws/charger/{charger_id}/sync"
 
+# J1772 control-pilot states that mean the connector is engaged with a vehicle.
+# A=unplugged, B=plugged not charging, C=plugged charging. V3 chargers only —
+# V2 may never report `pilot_status`, in which case is_plugged_in() returns None.
+PILOT_STATUS_PLUGGED = frozenset({"B", "C"})
+
 log = logging.getLogger(__name__)
 
 
@@ -47,6 +52,12 @@ class HypervoltClient:
         self._last_message_at: float | None = None
         self._drift_warned: bool = False
         self._task: asyncio.Task | None = None
+        # Set on every transition into a plugged-in state (unknown/False → True).
+        # The octopus loop waits on this to break out of its sleep early so a
+        # freshly-plugged car picks up planned dispatches within seconds.
+        # Consumer is responsible for clearing before each wait.
+        self.plugged_in_event = asyncio.Event()
+        self._was_plugged: bool | None = None
 
     async def aclose(self) -> None:
         if self._task and not self._task.done():
@@ -169,13 +180,30 @@ class HypervoltClient:
         if not isinstance(params, dict):
             return
         recognized = False
-        for key in ("ct_power", "charging", "max_current"):
+        for key in ("ct_power", "charging", "max_current", "pilot_status"):
             if key in params:
                 self._latest[key] = params[key]
                 recognized = True
         if recognized:
             self._latest_at = self._last_message_at
             self._drift_warned = False
+            self._update_plug_event()
+
+    def _update_plug_event(self) -> None:
+        plugged = self._compute_plugged()
+        if plugged is True and self._was_plugged is not True:
+            log.info("hypervolt: car plugged in (pilot_status=%s)",
+                     self._latest.get("pilot_status"))
+            self.plugged_in_event.set()
+        elif plugged is False and self._was_plugged is True:
+            log.info("hypervolt: car unplugged")
+        self._was_plugged = plugged
+
+    def _compute_plugged(self) -> bool | None:
+        pilot = self._latest.get("pilot_status")
+        if pilot is None:
+            return None
+        return pilot in PILOT_STATUS_PLUGGED
 
     def is_charging(self) -> bool | None:
         """True if the charger is currently delivering power. None if state is stale/unknown.
@@ -194,6 +222,18 @@ class HypervoltClient:
         if "charging" in self._latest:
             return bool(self._latest["charging"])
         return None
+
+    def is_plugged_in(self) -> bool | None:
+        """True if the connector is engaged with a vehicle. None if stale or unknown.
+
+        Derived from `pilot_status`. V2 chargers may never report this field, so
+        callers must treat None as "unknown" (and fail safe — e.g. keep polling)
+        rather than "definitely unplugged".
+        """
+        now = time.time()
+        if self._latest_at is None or now - self._latest_at > self._stale_seconds:
+            return None
+        return self._compute_plugged()
 
     def _maybe_warn_drift(self, now: float) -> None:
         # WS is delivering messages but none carry recognized fields — likely an
