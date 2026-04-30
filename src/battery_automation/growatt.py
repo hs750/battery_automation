@@ -24,6 +24,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import growattServer
+from growattServer.exceptions import GrowattV1ApiError
 
 LONDON = ZoneInfo("Europe/London")
 
@@ -78,22 +79,64 @@ class GrowattClient:
         await self._write_periods([self._cheap_period, _DISABLED_PERIOD, _DISABLED_PERIOD])
 
     async def _write_periods(self, periods: list[dict]) -> None:
-        await self._call_with_retry(
-            self._api.sph_write_ac_charge_times,
-            device_sn=self._device_sn,
-            charge_power=self._charge_power,
-            charge_stop_soc=self._charge_stop_soc,
-            mains_enabled=True,
-            periods=periods,
-        )
+        kwargs = {
+            "device_sn": self._device_sn,
+            "charge_power": self._charge_power,
+            "charge_stop_soc": self._charge_stop_soc,
+            "mains_enabled": True,
+            "periods": periods,
+        }
+        await self._call_with_retry(self._api.sph_write_ac_charge_times, **kwargs)
 
     async def _call_with_retry(self, fn, /, **kwargs) -> None:
+        request_summary = _summarise_request(fn, kwargs)
         try:
             await asyncio.to_thread(fn, **kwargs)
         except Exception as e:  # noqa: BLE001  -- vendor lib raises a mix of types
-            log.warning("growatt: call failed (%s); retrying once", e)
+            log.warning(
+                "growatt: %s call failed [%s]; retrying once. request=%s; cause=%s",
+                getattr(fn, "__name__", "api"),
+                _describe_exc(e),
+                request_summary,
+                e,
+            )
             await asyncio.sleep(1.0)
             await asyncio.to_thread(fn, **kwargs)
+
+
+def _describe_exc(e: BaseException) -> str:
+    parts = [type(e).__name__]
+    if isinstance(e, GrowattV1ApiError):
+        parts.append(f"error_code={e.error_code}")
+        parts.append(f"error_msg={e.error_msg!r}")
+    return " ".join(parts)
+
+
+def _summarise_request(fn, kwargs: dict) -> str:
+    name = getattr(fn, "__name__", "api")
+    safe = {k: v for k, v in kwargs.items() if k != "periods"}
+    if "device_sn" in safe:
+        safe["device_sn"] = _redact(safe["device_sn"])
+    periods = kwargs.get("periods")
+    if isinstance(periods, list):
+        safe["periods"] = [_format_period(p) for p in periods]
+    return f"{name}({safe})"
+
+
+def _format_period(p: dict) -> str:
+    start = p.get("start_time")
+    end = p.get("end_time")
+
+    def fmt(t):
+        return t.strftime("%H:%M") if hasattr(t, "strftime") else repr(t)
+
+    return f"{fmt(start)}-{fmt(end)} enabled={p.get('enabled')}"
+
+
+def _redact(value: str) -> str:
+    if not isinstance(value, str) or len(value) <= 4:
+        return "***"
+    return f"***{value[-4:]}"
 
 
 def slot_for_now(now: datetime, length: timedelta) -> tuple[datetime, datetime]:

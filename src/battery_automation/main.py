@@ -230,8 +230,12 @@ class Service:
         )
         try:
             await self._growatt.set_ac_charge(slot_start, slot_end)
-        except Exception as e:  # noqa: BLE001  -- vendor lib raises a mix of types
-            log.error("failed to set AC-charge window: %s", e)
+        except Exception:  # noqa: BLE001  -- vendor lib raises a mix of types
+            log.exception(
+                "failed to set AC-charge window %s → %s",
+                slot_start.isoformat(),
+                slot_end.isoformat(),
+            )
             return False
         self._last_growatt_write = now
         return True
