@@ -2,7 +2,6 @@ import pytest
 
 from battery_automation.config import load_config
 
-
 REQUIRED = {
     "OCTOPUS_API_KEY": "k",
     "OCTOPUS_ACCOUNT_NUMBER": "A-1",
@@ -14,8 +13,8 @@ REQUIRED = {
 
 
 def _set_env(monkeypatch, **extra):
-    # python-dotenv's load_dotenv() in load_config() is a no-op when the keys
-    # are already in os.environ, so monkeypatch.setenv is sufficient here.
+    # Keep config tests isolated from credentials in a developer's local .env.
+    monkeypatch.setattr("battery_automation.config.load_dotenv", lambda: None)
     for k, v in {**REQUIRED, **extra}.items():
         monkeypatch.setenv(k, v)
     # Strip anything we didn't explicitly set so test ordering is independent.
@@ -29,6 +28,8 @@ def _set_env(monkeypatch, **extra):
         "GROWATT_KEEPALIVE_SECONDS",
         "GROWATT_SLOT_LENGTH_SECONDS",
         "HYPERVOLT_STALE_SECONDS",
+        "HAPPY_HOURS_POLL_SECONDS",
+        "HAPPY_HOURS_STALE_SECONDS",
     ):
         if k not in extra:
             monkeypatch.delenv(k, raising=False)
@@ -40,6 +41,8 @@ def test_loads_with_defaults(monkeypatch):
     assert cfg.charge_power_percent == 100
     assert cfg.charge_stop_soc == 100
     assert cfg.hypervolt_stale_seconds == 300
+    assert cfg.happy_hours_poll_seconds == 120
+    assert cfg.happy_hours_stale_seconds == 300
 
 
 def test_missing_required_raises(monkeypatch):
@@ -70,7 +73,14 @@ def test_non_integer_percent_rejected(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "var", ["OCTOPUS_POLL_SECONDS", "DECISION_INTERVAL_SECONDS", "HYPERVOLT_STALE_SECONDS"]
+    "var",
+    [
+        "OCTOPUS_POLL_SECONDS",
+        "DECISION_INTERVAL_SECONDS",
+        "HYPERVOLT_STALE_SECONDS",
+        "HAPPY_HOURS_POLL_SECONDS",
+        "HAPPY_HOURS_STALE_SECONDS",
+    ],
 )
 def test_non_positive_intervals_rejected(monkeypatch, var):
     _set_env(monkeypatch, **{var: "0"})

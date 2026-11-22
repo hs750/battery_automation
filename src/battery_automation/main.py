@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import signal
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -12,6 +12,7 @@ import httpx
 from .config import Config, load_config
 from .decision import LONDON, Inputs, decide, in_window
 from .growatt import GrowattClient, slot_for_now
+from .happy_hours import HappyHoursClient, HappyHoursSnapshot
 from .hypervolt import HypervoltClient
 from .octopus import Dispatch, OctopusClient
 
@@ -28,22 +29,28 @@ class Service:
         octopus: OctopusClient,
         hypervolt: HypervoltClient,
         growatt: GrowattClient,
+        happy_hours: HappyHoursClient | None = None,
     ) -> None:
         self._cfg = cfg
         self._octopus = octopus
         self._hypervolt = hypervolt
         self._growatt = growatt
+        self._happy_hours = happy_hours
         self._dispatches: list[Dispatch] = []
+        self._happy_hours_snapshot: HappyHoursSnapshot | None = None
+        self._happy_hours_refreshed_at: datetime | None = None
         self._cheap_now: bool = False
+        self._charge_signature: tuple[str, datetime | None] | None = None
         self._last_growatt_write: datetime | None = None
         self._last_mismatch: str | None = None
         self._stop = asyncio.Event()
 
     @classmethod
-    def from_config(cls, cfg: Config) -> "Service":
+    def from_config(cls, cfg: Config) -> Service:
+        octopus = OctopusClient(cfg.octopus_api_key, cfg.octopus_account_number)
         return cls(
             cfg,
-            OctopusClient(cfg.octopus_api_key, cfg.octopus_account_number),
+            octopus,
             HypervoltClient(
                 cfg.hypervolt_email,
                 cfg.hypervolt_password,
@@ -57,6 +64,7 @@ class Service:
                 cfg.cheap_window_start,
                 cfg.cheap_window_end,
             ),
+            HappyHoursClient(octopus, cfg.octopus_account_number),
         )
 
     async def run(self) -> None:
@@ -76,18 +84,18 @@ class Service:
         await self._hypervolt.start()
 
         try:
-            await asyncio.gather(
+            loops = [
                 self._octopus_loop(),
                 self._decision_loop(),
                 self._stop.wait(),
-                return_exceptions=False,
-            )
+            ]
+            if self._happy_hours is not None:
+                loops.append(self._happy_hours_loop())
+            await asyncio.gather(*loops, return_exceptions=False)
         finally:
             log.info("shutting down: clearing dynamic slot (permanent fallback retained)")
             try:
-                await asyncio.wait_for(
-                    self._growatt.clear_dynamic_window(), timeout=15.0
-                )
+                await asyncio.wait_for(self._growatt.clear_dynamic_window(), timeout=15.0)
             except Exception as e:  # noqa: BLE001  -- vendor lib raises a mix of types
                 log.error("failed to clear dynamic slot on shutdown: %s", e)
             await self._hypervolt.aclose()
@@ -107,8 +115,10 @@ class Service:
                 # cached entries so a stale in-window dispatch can't drive a
                 # write after unplug.
                 if self._dispatches:
-                    log.debug("octopus: car unplugged, clearing %d cached dispatches",
-                              len(self._dispatches))
+                    log.debug(
+                        "octopus: car unplugged, clearing %d cached dispatches",
+                        len(self._dispatches),
+                    )
                     self._dispatches = []
             else:
                 # Plugged in (True) or unknown (None) — poll. Treating unknown
@@ -117,7 +127,7 @@ class Service:
                 try:
                     self._dispatches = await self._octopus.planned_dispatches()
                     log.debug("octopus: %d planned dispatches", len(self._dispatches))
-                except (httpx.HTTPError, RuntimeError, asyncio.TimeoutError) as e:
+                except (TimeoutError, httpx.HTTPError, RuntimeError) as e:
                     log.warning("octopus: poll failed: %s", e)
             await self._wait_octopus_interval()
 
@@ -140,6 +150,24 @@ class Service:
                     except asyncio.CancelledError:
                         pass
 
+    async def _happy_hours_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._happy_hours_snapshot = await self._happy_hours.poll()
+                self._happy_hours_refreshed_at = datetime.now(UTC)
+                log.debug(
+                    "happy hours: refreshed account bookings (%d)",
+                    len(self._happy_hours_snapshot.booked_happy_hours),
+                )
+            except Exception as error:  # noqa: BLE001 -- backend failures must not stop service
+                log.warning("happy hours: poll failed: %s", error)
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self._cfg.happy_hours_poll_seconds
+                )
+            except TimeoutError:
+                pass
+
     async def _decision_loop(self) -> None:
         while not self._stop.is_set():
             await self._evaluate_once()
@@ -148,30 +176,49 @@ class Service:
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=self._cfg.decision_interval_seconds
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _evaluate_once(self, now: datetime | None = None) -> None:
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
         in_dispatch = any(d.covers(now) for d in self._dispatches)
         ev_charging = self._hypervolt.is_charging()
+        happy_hour_end = self._active_happy_hour_end(now)
         decision = decide(
-            Inputs(in_planned_dispatch=in_dispatch, hypervolt_charging=ev_charging)
+            Inputs(
+                in_planned_dispatch=in_dispatch,
+                hypervolt_charging=ev_charging,
+                booked_happy_hour_end=happy_hour_end,
+            )
         )
         self._log_signal_mismatch(now, in_dispatch, ev_charging)
+        signature = (decision.reason, decision.charge_until)
 
-        if decision.cheap_now and not self._cheap_now:
+        if decision.cheap_now and (not self._cheap_now or signature != self._charge_signature):
             # Rising edge: only flip _cheap_now after a successful write so a
             # transient Growatt failure causes the next tick to retry as a
             # fresh rising edge rather than masquerading as sustained-high.
-            log.info("cheap_now → True (%s)", decision.reason)
-            if await self._write_charge_window(now):
+            log.info("dynamic charging → True (%s)", decision.reason)
+            if await self._write_charge_window(now, decision.charge_until):
                 self._cheap_now = True
+                self._charge_signature = signature
+            elif self._cheap_now and decision.charge_until is not None:
+                # The previous IOG or Happy Hour window may extend beyond the
+                # newly required bound. Clear it if the replacement failed.
+                try:
+                    await self._growatt.clear_dynamic_window()
+                except Exception:
+                    log.exception("failed to clear previous dynamic slot after failed rewrite")
+                else:
+                    self._cheap_now = False
+                    self._charge_signature = None
+                    self._last_growatt_write = None
         elif decision.cheap_now and self._cheap_now:
             if self._needs_keepalive(now):
                 log.debug("cheap_now keepalive (%s)", decision.reason)
-                await self._write_charge_window(now)
+                if await self._write_charge_window(now, decision.charge_until):
+                    self._charge_signature = signature
         elif not decision.cheap_now and self._cheap_now:
             # Falling edge: keep _cheap_now=True on failure to retry next tick.
             log.info("cheap_now → False (%s)", decision.reason)
@@ -182,6 +229,20 @@ class Service:
                 return
             self._last_growatt_write = None
             self._cheap_now = False
+            self._charge_signature = None
+
+    def _active_happy_hour_end(self, now: datetime) -> datetime | None:
+        snapshot = self._happy_hours_snapshot
+        refreshed_at = self._happy_hours_refreshed_at
+        if snapshot is None or refreshed_at is None:
+            return None
+        age = (now - refreshed_at).total_seconds()
+        if age < 0 or age >= self._cfg.happy_hours_stale_seconds:
+            return None
+        end = snapshot.active_end_at(now)
+        if end is None:
+            return None
+        return min(end, refreshed_at + timedelta(seconds=self._cfg.happy_hours_stale_seconds))
 
     def _log_signal_mismatch(
         self, now: datetime, in_dispatch: bool, ev_charging: bool | None
@@ -210,9 +271,7 @@ class Service:
         if current == "iog_dispatch_no_ev":
             log.info("signal mismatch: iog planned dispatch active but ev not charging")
         elif current == "ev_no_iog":
-            log.warning(
-                "signal mismatch: ev charging outside iog cheap period (peak-rate boost?)"
-            )
+            log.warning("signal mismatch: ev charging outside iog cheap period (peak-rate boost?)")
         elif self._last_mismatch is not None:
             log.info("signal mismatch resolved (was %s)", self._last_mismatch)
         self._last_mismatch = current
@@ -223,14 +282,22 @@ class Service:
         age = (now - self._last_growatt_write).total_seconds()
         return age >= self._cfg.growatt_keepalive_seconds
 
-    async def _write_charge_window(self, now: datetime) -> bool:
+    async def _write_charge_window(
+        self, now: datetime, charge_until: datetime | None = None
+    ) -> bool:
         """Write the dynamic AC-charge slot. Returns True on success, False on failure."""
         slot_start, slot_end = slot_for_now(
             now, timedelta(seconds=self._cfg.growatt_slot_length_seconds)
         )
+        if charge_until is not None:
+            slot_end = min(slot_end, charge_until)
+        slot_end = slot_end.replace(second=0, microsecond=0)
+        if slot_end <= slot_start:
+            log.warning("dynamic charging window is shorter than inverter time resolution")
+            return False
         try:
             await self._growatt.set_ac_charge(slot_start, slot_end)
-        except Exception:  # noqa: BLE001  -- vendor lib raises a mix of types
+        except Exception:
             log.exception(
                 "failed to set AC-charge window %s → %s",
                 slot_start.isoformat(),

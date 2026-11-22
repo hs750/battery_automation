@@ -68,6 +68,8 @@ class Config:
     growatt_keepalive_seconds: int
     growatt_slot_length_seconds: int
     hypervolt_stale_seconds: int
+    happy_hours_poll_seconds: int
+    happy_hours_stale_seconds: int
 
 
 def load_config() -> Config:
@@ -89,4 +91,6 @@ def load_config() -> Config:
         growatt_keepalive_seconds=_positive_int("GROWATT_KEEPALIVE_SECONDS", "600"),
         growatt_slot_length_seconds=_positive_int("GROWATT_SLOT_LENGTH_SECONDS", "900"),
         hypervolt_stale_seconds=_positive_int("HYPERVOLT_STALE_SECONDS", "300"),
+        happy_hours_poll_seconds=_positive_int("HAPPY_HOURS_POLL_SECONDS", "120"),
+        happy_hours_stale_seconds=_positive_int("HAPPY_HOURS_STALE_SECONDS", "300"),
     )

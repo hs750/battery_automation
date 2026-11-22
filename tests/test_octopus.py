@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from battery_automation.octopus import OctopusClient
+from battery_automation.octopus import BACKEND_GRAPHQL_URL, OctopusClient
 
 
 def _token_response(token: str) -> httpx.Response:
@@ -222,4 +222,38 @@ async def test_graphql_errors_raise():
     with pytest.raises(RuntimeError, match="octopus query error"):
         await client.planned_dispatches()
 
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_backend_endpoint_reuses_token_and_refreshes_on_401():
+    state = {"token_calls": 0, "backend_calls": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if "obtainKrakenToken" in body["query"]:
+            state["token_calls"] += 1
+            return _token_response(f"jwt-{state['token_calls']}")
+        assert str(request.url) == BACKEND_GRAPHQL_URL
+        state["backend_calls"] += 1
+        if state["backend_calls"] == 1:
+            assert request.headers["Authorization"] == "jwt-1"
+            return httpx.Response(401, json={"errors": [{"message": "expired"}]})
+        assert request.headers["Authorization"] == "jwt-2"
+        assert body["variables"] == {"accountNumber": "A-1"}
+        return httpx.Response(
+            200,
+            json={"data": {"savingSessions": {"account": {"joinedEvents": []}}}},
+        )
+
+    client = OctopusClient("k", "A-1")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=15)
+
+    result = await client.post_backend_authed(
+        "query HappyHours { savingSessions { account { joinedEvents { eventType } } } }",
+        {"accountNumber": "A-1"},
+    )
+
+    assert result == {"savingSessions": {"account": {"joinedEvents": []}}}
+    assert state == {"token_calls": 2, "backend_calls": 2}
     await client.aclose()

@@ -12,7 +12,7 @@ Kept free of IO so it can be unit-tested without mocks.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 LONDON = ZoneInfo("Europe/London")
@@ -22,12 +22,14 @@ LONDON = ZoneInfo("Europe/London")
 class Inputs:
     in_planned_dispatch: bool
     hypervolt_charging: bool | None  # None = unknown / stale
+    booked_happy_hour_end: datetime | None = None
 
 
 @dataclass(frozen=True)
 class Decision:
     cheap_now: bool
     reason: str
+    charge_until: datetime | None = None
 
 
 def in_window(now_local: time, start: time, end: time) -> bool:
@@ -43,8 +45,18 @@ def decide(inp: Inputs) -> Decision:
     the inverter's permanent slot 1 and is intentionally outside the scope of
     this function.
     """
+    iog_charge = inp.in_planned_dispatch and inp.hypervolt_charging is True
+    happy_hour_charge = inp.booked_happy_hour_end is not None
+    if iog_charge and happy_hour_charge:
+        return Decision(True, "iog planned dispatch + ev charging + booked happy hour")
+    if iog_charge:
+        return Decision(True, "iog planned dispatch + ev charging")
+    if happy_hour_charge:
+        return Decision(
+            True,
+            "booked happy hour",
+            charge_until=inp.booked_happy_hour_end,
+        )
     if not inp.in_planned_dispatch:
         return Decision(False, "no iog dispatch")
-    if not inp.hypervolt_charging:
-        return Decision(False, "iog dispatch but ev not charging")
-    return Decision(True, "iog planned dispatch + ev charging")
+    return Decision(False, "iog dispatch but ev not charging")

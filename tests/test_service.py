@@ -1,10 +1,11 @@
 import asyncio
-from datetime import datetime, time, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from battery_automation.config import Config
+from battery_automation.happy_hours import BookedHappyHour, HappyHoursSnapshot
 from battery_automation.main import Service
 from battery_automation.octopus import Dispatch
 
@@ -12,24 +13,26 @@ LONDON = ZoneInfo("Europe/London")
 
 
 def _cfg(**overrides) -> Config:
-    base = dict(
-        octopus_api_key="k",
-        octopus_account_number="A-1",
-        hypervolt_email="e@example.com",
-        hypervolt_password="p",
-        growatt_api_token="t",
-        growatt_device_sn="s",
-        cheap_window_start=time(23, 0),
-        cheap_window_end=time(5, 30),
-        charge_power_percent=100,
-        charge_stop_soc=100,
-        log_level="WARNING",
-        octopus_poll_seconds=120,
-        decision_interval_seconds=60,
-        growatt_keepalive_seconds=600,
-        growatt_slot_length_seconds=900,
-        hypervolt_stale_seconds=300,
-    )
+    base = {
+        "octopus_api_key": "k",
+        "octopus_account_number": "A-1",
+        "hypervolt_email": "e@example.com",
+        "hypervolt_password": "p",
+        "growatt_api_token": "t",
+        "growatt_device_sn": "s",
+        "cheap_window_start": time(23, 0),
+        "cheap_window_end": time(5, 30),
+        "charge_power_percent": 100,
+        "charge_stop_soc": 100,
+        "log_level": "WARNING",
+        "octopus_poll_seconds": 120,
+        "decision_interval_seconds": 60,
+        "growatt_keepalive_seconds": 600,
+        "growatt_slot_length_seconds": 900,
+        "hypervolt_stale_seconds": 300,
+        "happy_hours_poll_seconds": 120,
+        "happy_hours_stale_seconds": 300,
+    }
     base.update(overrides)
     return Config(**base)
 
@@ -89,13 +92,25 @@ class FakeGrowatt:
         self.calls.append(("clear_dynamic",))
 
 
+class FakeHappyHours:
+    def __init__(self):
+        self.poll_count = 0
+        self.error = None
+
+    async def poll(self):
+        self.poll_count += 1
+        if self.error is not None:
+            raise self.error
+        return HappyHoursSnapshot(())
+
+
 def _service() -> Service:
     return Service(_cfg(), FakeOctopus(), FakeHypervolt(), FakeGrowatt())
 
 
 def _at(local_hhmm: str) -> datetime:
     h, m = local_hhmm.split(":")
-    return datetime(2026, 4, 25, int(h), int(m), tzinfo=LONDON).astimezone(timezone.utc)
+    return datetime(2026, 4, 25, int(h), int(m), tzinfo=LONDON).astimezone(UTC)
 
 
 def _dispatch(now: datetime, start_offset_min: int, end_offset_min: int) -> Dispatch:
@@ -106,6 +121,13 @@ def _dispatch(now: datetime, start_offset_min: int, end_offset_min: int) -> Disp
         source=None,
         location=None,
     )
+
+
+def _set_happy_hour(
+    service: Service, start: datetime, end: datetime, refreshed_at: datetime
+) -> None:
+    service._happy_hours_snapshot = HappyHoursSnapshot((BookedHappyHour(start, end),))
+    service._happy_hours_refreshed_at = refreshed_at
 
 
 @pytest.mark.asyncio
@@ -135,7 +157,7 @@ async def test_rising_edge_during_planned_dispatch_writes():
     await s._evaluate_once(now)
     assert s._cheap_now is True
     assert s._growatt.calls[0][0] == "set"
-    kind, start, end = s._growatt.calls[0]
+    _kind, start, end = s._growatt.calls[0]
     assert (end - start) == timedelta(seconds=900)
 
 
@@ -148,6 +170,168 @@ async def test_planned_dispatch_without_ev_charging_skips_dynamic_slot():
     await s._evaluate_once(now)
     assert s._cheap_now is False
     assert s._growatt.calls == []
+
+
+@pytest.mark.asyncio
+async def test_active_booked_happy_hour_charges_and_caps_slot_end():
+    s = _service()
+    s._cfg = _cfg(happy_hours_stale_seconds=1200)
+    now = _at("14:00")
+    happy_hour_end = now + timedelta(minutes=10)
+    _set_happy_hour(s, now - timedelta(minutes=1), happy_hour_end, now)
+
+    await s._evaluate_once(now)
+
+    assert s._cheap_now is True
+    assert s._growatt.calls[0][0] == "set"
+    assert s._growatt.calls[0][2] == happy_hour_end
+
+
+@pytest.mark.asyncio
+async def test_unbooked_or_stale_happy_hour_does_not_start_charging():
+    s = _service()
+    now = _at("14:00")
+    _set_happy_hour(
+        s,
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=30),
+        now - timedelta(seconds=301),
+    )
+
+    await s._evaluate_once(now)
+
+    assert s._cheap_now is False
+    assert s._growatt.calls == []
+
+
+@pytest.mark.asyncio
+async def test_iog_charge_is_not_capped_but_happy_hour_takes_over_at_dispatch_end():
+    s = _service()
+    s._hypervolt.charging = True
+    now = _at("14:00")
+    happy_hour_end = now + timedelta(minutes=10)
+    _set_happy_hour(s, now - timedelta(minutes=1), happy_hour_end, now)
+    s._dispatches = [_dispatch(now, -5, 5)]
+
+    await s._evaluate_once(now)
+    assert s._growatt.calls[0][2] == now + timedelta(seconds=900)
+
+    after_dispatch = now + timedelta(minutes=6)
+    _set_happy_hour(s, now - timedelta(minutes=1), happy_hour_end, after_dispatch)
+    await s._evaluate_once(after_dispatch)
+
+    assert len(s._growatt.calls) == 2
+    assert s._growatt.calls[1][2] == happy_hour_end
+
+
+@pytest.mark.asyncio
+async def test_stale_booking_clears_previously_active_dynamic_slot():
+    s = _service()
+    now = _at("14:00")
+    end = now + timedelta(minutes=30)
+    _set_happy_hour(s, now - timedelta(minutes=1), end, now)
+    await s._evaluate_once(now)
+
+    stale_now = now + timedelta(minutes=6)
+    await s._evaluate_once(stale_now)
+
+    assert s._cheap_now is False
+    assert s._growatt.calls[-1] == ("clear_dynamic",)
+
+
+@pytest.mark.asyncio
+async def test_happy_hour_slot_is_bounded_by_snapshot_expiry():
+    s = _service()
+    now = _at("14:00")
+    _set_happy_hour(s, now - timedelta(minutes=1), now + timedelta(hours=1), now)
+
+    await s._evaluate_once(now)
+
+    assert s._growatt.calls[0][2] == now + timedelta(seconds=300)
+
+
+@pytest.mark.asyncio
+async def test_booking_expires_exactly_at_freshness_deadline():
+    s = _service()
+    now = _at("14:00")
+    _set_happy_hour(s, now, now + timedelta(hours=1), now)
+    await s._evaluate_once(now)
+
+    await s._evaluate_once(now + timedelta(seconds=300))
+
+    assert s._growatt.calls[-1] == ("clear_dynamic",)
+
+
+@pytest.mark.asyncio
+async def test_happy_hour_shorter_than_inverter_minute_is_not_written():
+    s = _service()
+    now = _at("14:00") + timedelta(seconds=30)
+    _set_happy_hour(s, now, now + timedelta(seconds=15), now)
+
+    await s._evaluate_once(now)
+
+    assert not s._growatt.calls
+
+
+@pytest.mark.asyncio
+async def test_failed_iog_to_happy_hour_rewrite_clears_old_window():
+    s = _service()
+    s._hypervolt.charging = True
+    now = _at("14:00")
+    _set_happy_hour(s, now, now + timedelta(minutes=20), now)
+    s._dispatches = [_dispatch(now, -5, 5)]
+    await s._evaluate_once(now)
+
+    s._growatt.fail_next_set = True
+    transition = now + timedelta(minutes=6)
+    _set_happy_hour(s, now, now + timedelta(minutes=20), transition)
+    await s._evaluate_once(transition)
+
+    assert s._growatt.calls[-1] == ("clear_dynamic",)
+    assert not s._cheap_now
+    await s._evaluate_once(transition + timedelta(seconds=10))
+    assert s._cheap_now
+
+
+@pytest.mark.asyncio
+async def test_happy_hours_poll_is_independent_of_ev_plug_state():
+    client = FakeHappyHours()
+    s = Service(
+        _cfg(happy_hours_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+        client,
+    )
+    s._hypervolt.plugged = False
+
+    task = asyncio.create_task(s._happy_hours_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert client.poll_count == 1
+    assert s._happy_hours_snapshot is not None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_happy_hours_error_does_not_stop_poller():
+    client = FakeHappyHours()
+    client.error = KeyError("backend schema changed")
+    s = Service(
+        _cfg(happy_hours_poll_seconds=10),
+        FakeOctopus(),
+        FakeHypervolt(),
+        FakeGrowatt(),
+        client,
+    )
+
+    task = asyncio.create_task(s._happy_hours_loop())
+    await asyncio.sleep(0.05)
+    s.request_stop()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert client.poll_count == 1
 
 
 @pytest.mark.asyncio
@@ -238,8 +422,7 @@ async def test_logs_dispatch_without_ev_mismatch(caplog):
     with caplog.at_level("INFO", logger="battery_automation"):
         await s._evaluate_once(now)
         assert any(
-            "iog planned dispatch active but ev not charging" in r.message
-            for r in caplog.records
+            "iog planned dispatch active but ev not charging" in r.message for r in caplog.records
         )
         caplog.clear()
 
@@ -271,8 +454,7 @@ async def test_logs_peak_rate_boost_mismatch(caplog):
         # 19:00, EV charging, no IOG cheap signal — manual peak-rate boost.
         await s._evaluate_once(_at("19:00"))
         assert any(
-            "peak-rate boost" in r.message and r.levelname == "WARNING"
-            for r in caplog.records
+            "peak-rate boost" in r.message and r.levelname == "WARNING" for r in caplog.records
         )
 
 

@@ -4,9 +4,9 @@ Last updated: 2026-11-22
 
 ## Goal
 
-Keep the Growatt SPH3000's permanent AC-charge slot configured for the local cheap window (default 23:30–05:30, configurable). Separately, use a dynamic AC-charge slot during an active IOG planned dispatch only when Hypervolt confirms that the EV is charging. Unknown or stale Hypervolt state does not qualify, and there is no Hypervolt-only fallback.
+Keep the Growatt SPH3000's permanent AC-charge slot configured for the local cheap window (default 23:30–05:30, configurable). Use the dynamic slot for a confirmed IOG planned dispatch when Hypervolt confirms the EV is charging, or for an active Weekend Happy Hour booked on this account. No other Saving Session events are discovered, joined, or used to control the battery.
 
-The permanent overnight slot is independent of the service's dynamic decision loop and remains configured if the service stops. The dynamic slot protects the home battery during confirmed daytime IOG charging without enabling a charge based only on EV power draw.
+The permanent overnight slot is independent of the service's dynamic decision loop and remains configured if the service stops. The dynamic slot protects the home battery during confirmed IOG charging without enabling a charge based only on EV power draw. A booked Happy Hour can independently enable the same configured charge power and stop SoC, even when the EV is not charging.
 
 ## Hardware
 
@@ -20,12 +20,21 @@ The permanent overnight slot is independent of the service's dynamic decision lo
 
 ## Charging logic (current)
 
-Charging has two independent paths:
+Charging has three paths:
 
 1. **Permanent overnight window**: Growatt slot 1 is configured for the local window set by `CHEAP_WINDOW_START` and `CHEAP_WINDOW_END` (defaults: 23:30–05:30 Europe/London). It does not depend on an Octopus or Hypervolt signal or on the service remaining running.
-2. **Dynamic IOG charging**: the decision is true only when an Octopus planned dispatch covers `now` **and** Hypervolt confirms the EV is charging. A false, unknown, or stale Hypervolt state does not enable dynamic charging. There is no Hypervolt-only fallback, and the overnight window is not part of this dynamic decision.
+2. **Dynamic IOG charging**: the decision is true only when an Octopus planned dispatch covers `now` **and** Hypervolt confirms the EV is charging. A false, unknown, or stale Hypervolt state does not enable IOG-driven dynamic charging. There is no Hypervolt-only fallback, and the overnight window is not part of this dynamic decision.
+3. **Booked Weekend Happy Hour**: an active `WEEKEND_HAPPY_HOUR` in the account's `joinedEvents` enables the dynamic slot using the existing configured Growatt charge power and stop SoC. A public event without account participation does not qualify. The slot ends no later than the booking end or freshness deadline when Happy Hour is the only active reason; IOG charging is not shortened when both reasons overlap. The free-consumption allowance is not monitored, so some charging may be billed if it exceeds the allowance.
 
-The dynamic decision is reevaluated every 60 seconds. On a false→true edge, the service writes a dynamic slot covering the current time through the next 15 minutes; while the decision stays true, it refreshes that slot on a 10-minute keepalive. On a true→false edge, it clears the dynamic slot. Because the inverter receives time-of-day slot settings, do not assume that a dynamic slot automatically disappears if the process crashes before clearing it. Startup and normal shutdown clear the dynamic slot; the permanent overnight slot remains configured.
+The dynamic decision is reevaluated every 60 seconds. On a false→true edge or a change in charging reason/end bound, the service writes a dynamic slot covering the current time through the next 15 minutes, capped at the booked-hour end when applicable; while the decision stays true, it refreshes that slot on a 10-minute keepalive. On a true→false edge, it clears the dynamic slot. Because the inverter receives time-of-day slot settings, do not assume that a dynamic slot automatically disappears if the process crashes before clearing it. Startup and normal shutdown clear the dynamic slot; the permanent overnight slot remains configured.
+
+## Weekend Happy Hours
+
+The Happy Hours poller is independent of EV plug state and shares the existing serialized Growatt decision/write path. It uses the Octopus backend GraphQL `savingSessions.account.joinedEvents` field with the existing Kraken token, requesting only event type and start/end timestamps. It does not query public events or send mutations; no Saving Session joins or free-hour bookings are automated.
+
+The backend GraphQL API is not documented as a stable public customer API. Only a valid, active account-joined `WEEKEND_HAPPY_HOUR` causes charging; malformed booking data fails closed. Tests use fake clients and do not perform account-specific API calls or inverter control. [`SAVING_SESSIONS.md`](./SAVING_SESSIONS.md) is historical API research and does not describe the current runtime feature.
+
+`HAPPY_HOURS_POLL_SECONDS` defaults to 120 and controls account-booking polling. `HAPPY_HOURS_STALE_SECONDS` defaults to 300; unknown or older account state disables Happy Hour charging. Neither value can be zero or negative. These replace the former `SAVING_SESSIONS_POLL_SECONDS` and `SAVING_SESSIONS_STALE_SECONDS` settings.
 
 ## API choices (verified 2026-04-25)
 
@@ -55,7 +64,7 @@ The dynamic decision is reevaluated every 60 seconds. On a false→true edge, th
 - **Endpoint**: `openapi.growatt.com/v1/`. Avoid the legacy `server-api.growatt.com` and the username/password path — both rate-limit aggressively and the latter has locked accounts in the past.
 - **SPH write call**: `OpenApiV1.sph_write_ac_charge_times(device_sn, charge_power, charge_stop_soc, mains_enabled, periods)`. Each write specifies all three periods: slot 1 is the permanent cheap window, slot 2 is the dynamic slot, and slot 3 is disabled.
 - **Slot ownership and lifecycle**: the service controls all three slots and overwrites their prior settings when it writes. At startup it asserts the permanent slot and clears the dynamic slot; at shutdown it clears the dynamic slot and retains the permanent slot. A service stop therefore does not remove the overnight schedule.
-- **Dynamic-slot approach**: at the dynamic decision's rising edge, write an enabled slot covering `[now, now+15min]`; refresh it every ~10 min while the decision remains true. At the falling edge, disable slot 2. If the process stops ungracefully, slot 2 may remain configured until a later startup/write clears or replaces it, or it is cleared manually; do not treat the 15-minute period length as proof of automatic schedule removal.
+- **Dynamic-slot approach**: at the dynamic decision's rising edge or a change in charging reason/end bound, write an enabled slot covering `[now, now+15min]`, capped at the booked Happy Hour end when that is the only active reason; refresh it every ~10 min while the decision remains true. At the falling edge, disable slot 2. If the process stops ungracefully, slot 2 may remain configured until a later startup/write clears or replaces it, or it is cleared manually; do not treat the 15-minute period length as proof of automatic schedule removal.
 - **Fallback if cloud writes flake**: *deferred — not implemented (2026-04-26)*. See "Modbus fallback (deferred)" below for what this would buy us and what it'd take to add later.
 
 ## Architecture (proposed)
@@ -66,8 +75,9 @@ Single Python service running in a long-lived loop:
 ┌─────────────────────────────────────────────────────────┐
 │  battery_automation/                                    │
 │    main.py                  ← orchestrator + edge logic │
-│    decision.py              ← pure cheap_now logic      │
-│    octopus.py               ← GraphQL plannedDispatches │
+│    decision.py              ← pure charge decision      │
+│    octopus.py               ← shared GraphQL auth       │
+│    happy_hours.py           ← read account bookings     │
 │    hypervolt.py             ← Keycloak auth + WS client │
 │    growatt.py               ← growattServer wrapper     │
 │    config.py                ← secrets from env / .env   │
@@ -80,7 +90,8 @@ dynamic slot, and disables slot 3. This overwrites prior settings for those slot
 the permanent slot remains configured at shutdown.
 
 Loop cadence:
-- Octopus polled every 120s.
+- IOG dispatches polled every 120s (while the EV is plugged in or plug state is unknown).
+- Weekend Happy Hour account bookings polled independently every 120s by default.
 - Hypervolt WS pushes state changes; reconnect on drop.
 - Decision recomputed every 60s and on any WS event.
 - Dynamic Growatt slot writes on decision edges, plus a 10-min keepalive while active; every write also reasserts the permanent slot and disables slot 3.
@@ -99,6 +110,8 @@ Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs
 - 2026-04-25: Full-battery during dispatch = no-op (just stop charging).
 - 2026-04-25: Solar producing during a daytime dispatch = force grid AC-charge anyway.
 - 2026-11-22: Confirmed current behavior: permanent configurable overnight slot (default 23:30–05:30) plus a dynamic slot only for an active planned dispatch with confirmed EV charging; unknown/stale EV state fails closed, and no Hypervolt-only fallback is used. The service writes all three Growatt slots, with the permanent window retained if the service stops.
+- 2026-11-22: First Saving Sessions iteration charges during account-booked Weekend Happy Hours using the existing dynamic slot. Automatic event joining is blocked because individual invitations cannot currently be confirmed. It does not adjust battery behavior during Power Down/Power Up, book Happy Hours, or monitor the free-consumption allowance.
+- 2026-11-22: Simplified event automation to read-only Weekend Happy Hour account bookings. Removed public event discovery and all Saving Session join/booking behavior; charging during confirmed booked free hours and existing IOG/overnight behavior remain.
 
 ## Notes
 
@@ -118,6 +131,8 @@ Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs
 1. **Dynamic slot left active after a crash.** If the service stops ungracefully while a dynamic charge is active, slot 2 may remain configured; automatic removal after 15 minutes is not established by the code. Mitigation: normal shutdown and the next startup clear the dynamic slot; the permanent overnight slot remains configured independently.
 2. **Missed dispatch or unavailable EV state.** If Octopus misses a dispatch or Hypervolt state is unknown/stale, dynamic charging is not enabled even if the EV is drawing power. This fail-closed behavior avoids charging on an unconfirmed Hypervolt-only signal but can leave the home battery supporting the EV during a cheap dispatch.
 3. **Growatt cloud write flakiness.** Open HA regression on `write_ac_charge_times` (home-assistant/core#166817, Mar 2026). We're not using HA, so we sidestep it, but the underlying API still wobbles. No parachute today (Modbus fallback deferred — see below); a sustained Growatt cloud outage means no dynamic AC-charge writes. The permanent slot 1 keeps honoring the nightly window regardless.
+4. **Octopus Happy Hours backend API can change.** Account booking data is read from a backend schema that is not documented as a stable customer API. Unknown response shapes fail closed, but API outages can cause booking data to become stale.
+5. **Happy Hour consumption cap is not monitored.** The service charges during a confirmed booking using the existing configured power and SoC settings; it cannot tell when the free-consumption allowance is exhausted, so some consumption could be billed.
 
 ## Deferred work
 

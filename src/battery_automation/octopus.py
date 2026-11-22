@@ -1,10 +1,11 @@
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
 GRAPHQL_URL = "https://api.octopus.energy/v1/graphql/"
+BACKEND_GRAPHQL_URL = "https://api.backend.octopus.energy/v1/graphql/"
 
 OBTAIN_TOKEN_MUTATION = """
 mutation Login($input: ObtainJSONWebTokenInput!) {
@@ -72,7 +73,7 @@ class OctopusClient:
         log.info("octopus: obtained kraken token")
         return self._token
 
-    async def _post_authed(self, query: str, variables: dict) -> dict:
+    async def _post_authed(self, query: str, variables: dict, endpoint: str = GRAPHQL_URL) -> dict:
         """POST a GraphQL query with the cached token; on auth failure, refresh once and retry.
 
         Kraken signals expiry two ways: HTTP 401, or HTTP 200 with a GraphQL error
@@ -80,33 +81,30 @@ class OctopusClient:
         """
         payload = {"query": query, "variables": variables}
         token = await self._ensure_token()
-        r = await self._client.post(
-            GRAPHQL_URL, headers={"Authorization": token}, json=payload
-        )
+        r = await self._client.post(endpoint, headers={"Authorization": token}, json=payload)
         refresh = r.status_code == 401 or (
-            r.status_code == 200
-            and _is_expired_token_error(r.json().get("errors") or [])
+            r.status_code == 200 and _is_expired_token_error(r.json().get("errors") or [])
         )
         if refresh:
             self._token = None
             token = await self._ensure_token()
-            r = await self._client.post(
-                GRAPHQL_URL, headers={"Authorization": token}, json=payload
-            )
+            r = await self._client.post(endpoint, headers={"Authorization": token}, json=payload)
         r.raise_for_status()
         data = r.json()
         if "errors" in data:
             raise RuntimeError(f"octopus query error: {data['errors']}")
         return data["data"]
 
+    async def post_backend_authed(self, query: str, variables: dict) -> dict:
+        """Use the shared Kraken token against Octopus's backend GraphQL endpoint."""
+        return await self._post_authed(query, variables, BACKEND_GRAPHQL_URL)
+
     async def planned_dispatches(self) -> list[Dispatch]:
-        data = await self._post_authed(
-            PLANNED_DISPATCHES_QUERY, {"input": self._account_number}
-        )
+        data = await self._post_authed(PLANNED_DISPATCHES_QUERY, {"input": self._account_number})
         return [_parse_dispatch(d) for d in data["plannedDispatches"] or []]
 
     async def active_dispatch(self, now: datetime | None = None) -> Dispatch | None:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         for d in await self.planned_dispatches():
             if d.covers(now):
                 return d
