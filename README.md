@@ -10,6 +10,8 @@ During a booked Happy Hour, the service uses the existing configured Growatt cha
 
 `HAPPY_HOURS_POLL_SECONDS` (default `120`) and `HAPPY_HOURS_STALE_SECONDS` (default `300`) configure polling and the maximum age of booking data; both must be positive integers. These replace the former `SAVING_SESSIONS_POLL_SECONDS` and `SAVING_SESSIONS_STALE_SECONDS` names.
 
+At the default `INFO` log level, routine successful HTTPX request lines for the backend GraphQL endpoint are suppressed. Request failures, GraphQL errors, and requests to other endpoints remain visible; set `LOG_LEVEL=DEBUG` to show the successful backend request lines as well.
+
 ## Run locally
 
 ```sh

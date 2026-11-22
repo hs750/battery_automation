@@ -14,9 +14,11 @@ from .decision import LONDON, Inputs, decide, in_window
 from .growatt import GrowattClient, slot_for_now
 from .happy_hours import HappyHoursClient, HappyHoursSnapshot
 from .hypervolt import HypervoltClient
-from .octopus import Dispatch, OctopusClient
+from .octopus import BACKEND_GRAPHQL_URL, Dispatch, OctopusClient
 
 log = logging.getLogger("battery_automation")
+
+_HTTPX_REQUEST_LOG = 'HTTP Request: %s %s "%s %d %s"'
 
 # Touched after each successful decision tick. Docker healthcheck reads its mtime.
 LIVENESS_PATH = Path(os.environ.get("LIVENESS_PATH", "/tmp/battery-automation-alive"))
@@ -315,11 +317,28 @@ def _touch_liveness() -> None:
         log.debug("liveness touch failed: %s", e)
 
 
+class _SuppressSuccessfulBackendRequest(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno != logging.INFO or record.msg != _HTTPX_REQUEST_LOG:
+            return True
+        if not isinstance(record.args, tuple) or len(record.args) != 5:
+            return True
+        method, url, _, status_code, _ = record.args
+        return not (method == "POST" and str(url) == BACKEND_GRAPHQL_URL and status_code == 200)
+
+
 def _setup_logging(level: str) -> None:
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
+        level=numeric_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    httpx_logger = logging.getLogger("httpx")
+    for existing_filter in httpx_logger.filters:
+        if isinstance(existing_filter, _SuppressSuccessfulBackendRequest):
+            httpx_logger.removeFilter(existing_filter)
+    if numeric_level > logging.DEBUG:
+        httpx_logger.addFilter(_SuppressSuccessfulBackendRequest())
 
 
 async def _main() -> None:
