@@ -1,12 +1,12 @@
 # Battery Automation — Decisions & Knowledge
 
-Last updated: 2026-04-26
+Last updated: 2026-11-22
 
 ## Goal
 
-Mirror the Intelligent Octopus Go (IOG) cheap-rate signal onto the home battery: whenever IOG is making electricity cheap (because it has dispatched the EV charger off-window, or because we're inside the standard 23:00–05:30 window), force the Growatt SPH3000 to AC-charge from the grid. Stop charging when the cheap window ends.
+Keep the Growatt SPH3000's permanent AC-charge slot configured for the local cheap window (default 23:30–05:30, configurable). Separately, use a dynamic AC-charge slot during an active IOG planned dispatch only when Hypervolt confirms that the EV is charging. Unknown or stale Hypervolt state does not qualify, and there is no Hypervolt-only fallback.
 
-Today the inverter only AC-charges in its scheduled night window, so when IOG dispatches the car at, say, 14:00, the EV pulls cheap grid power *and* the house battery, draining the battery at peak rate effectively for free to the car owner — exactly the wrong outcome.
+The permanent overnight slot is independent of the service's dynamic decision loop and remains configured if the service stops. The dynamic slot protects the home battery during confirmed daytime IOG charging without enabling a charge based only on EV power draw.
 
 ## Hardware
 
@@ -15,19 +15,17 @@ Today the inverter only AC-charges in its scheduled night window, so when IOG di
 | Inverter | Growatt **SPH3000** | Single-phase hybrid. Uses SPH/MIX register set & API surface. |
 | Battery | Growatt **ARK 7.6L** (~7.68 kWh) | Charge target: 100%. |
 | EV charger | **Hypervolt Home 3 Pro** | Cloud-only API, no local LAN endpoint exists. |
-| Tariff | Octopus **Intelligent Octopus Go** | Standard cheap window: 23:00–05:30 (user-stated). |
+| Tariff | Octopus **Intelligent Octopus Go** | Configured cheap window defaults to 23:30–05:30 and can be changed with `CHEAP_WINDOW_START` / `CHEAP_WINDOW_END`. |
 | Host | Docker container on user's NAS | Long-running service, restart policy `unless-stopped`. |
 
-## Cheap-rate detection logic (decided)
+## Charging logic (current)
 
-A boolean `cheap_now` is true when **any** of the following holds:
-1. **Standard window**: local time is within 23:00–05:30 Europe/London. Ground truth, no API needed.
-2. **Planned IOG dispatch**: Octopus GraphQL `plannedDispatches` returns a slot covering `now`.
-3. **Active EV charge as fallback**: Hypervolt is drawing >1 kW (`ct_power > 1000`) AND it's outside peak hours that IOG never dispatches in. Used only as a corroborating signal for the case where Octopus's API misses an announcement (known to happen).
+Charging has two independent paths:
 
-Combine as `cheap_now = standard_window OR planned_dispatch OR (hypervolt_charging AND not_obviously_peak)`.
+1. **Permanent overnight window**: Growatt slot 1 is configured for the local window set by `CHEAP_WINDOW_START` and `CHEAP_WINDOW_END` (defaults: 23:30–05:30 Europe/London). It does not depend on an Octopus or Hypervolt signal or on the service remaining running.
+2. **Dynamic IOG charging**: the decision is true only when an Octopus planned dispatch covers `now` **and** Hypervolt confirms the EV is charging. A false, unknown, or stale Hypervolt state does not enable dynamic charging. There is no Hypervolt-only fallback, and the overnight window is not part of this dynamic decision.
 
-Re-evaluate every 60s. The script writes to the inverter only on **edges** (false→true: enable AC-charge; true→false: disable) to stay under Growatt's rate limits.
+The dynamic decision is reevaluated every 60 seconds. On a false→true edge, the service writes a dynamic slot covering the current time through the next 15 minutes; while the decision stays true, it refreshes that slot on a 10-minute keepalive. On a true→false edge, it clears the dynamic slot. Because the inverter receives time-of-day slot settings, do not assume that a dynamic slot automatically disappears if the process crashes before clearing it. Startup and normal shutdown clear the dynamic slot; the permanent overnight slot remains configured.
 
 ## API choices (verified 2026-04-25)
 
@@ -55,9 +53,9 @@ Re-evaluate every 60s. The script writes to the inverter only on **edges** (fals
 - **Library**: `growattServer` 2.1.0 on PyPI (<https://github.com/indykoning/PyPi_GrowattServer>, last release 2026-04-16). Active.
 - **Auth**: API token from ShinePhone app → Me → API Token (or `openapi.growatt.com` web UI → Account Management). One-time setup; user must request the token in-app.
 - **Endpoint**: `openapi.growatt.com/v1/`. Avoid the legacy `server-api.growatt.com` and the username/password path — both rate-limit aggressively and the latter has locked accounts in the past.
-- **SPH write call**: `OpenApiV1.sph_write_ac_charge_times(device_sn, charge_power, charge_stop_soc, mains_enabled, periods)`. `periods` is a list of three `{start_time, end_time, enabled}` dicts; we use period 1 for the live slot and disable periods 2 & 3.
-- **Approach**: at `cheap_now` rising edge, write an AC-charge slot covering `[now, now+15min]` with enable=true. Refresh the slot every ~10 min while still cheap (extends end time). At falling edge, write enable=false. The 15-min sliding-window pattern is so a crashed script can't leave the inverter in force-charge mode for hours — the inverter will fall out of AC-charge naturally within 15 min if our process dies.
-- **Standard 23:00–05:30 window**: same mechanism — the script owns this window too. The user's existing AC-charge schedule on the inverter will be cleared on first run (decided 2026-04-25); from then on every AC-charge slot is written by this service. This avoids two systems fighting over the slot.
+- **SPH write call**: `OpenApiV1.sph_write_ac_charge_times(device_sn, charge_power, charge_stop_soc, mains_enabled, periods)`. Each write specifies all three periods: slot 1 is the permanent cheap window, slot 2 is the dynamic slot, and slot 3 is disabled.
+- **Slot ownership and lifecycle**: the service controls all three slots and overwrites their prior settings when it writes. At startup it asserts the permanent slot and clears the dynamic slot; at shutdown it clears the dynamic slot and retains the permanent slot. A service stop therefore does not remove the overnight schedule.
+- **Dynamic-slot approach**: at the dynamic decision's rising edge, write an enabled slot covering `[now, now+15min]`; refresh it every ~10 min while the decision remains true. At the falling edge, disable slot 2. If the process stops ungracefully, slot 2 may remain configured until a later startup/write clears or replaces it, or it is cleared manually; do not treat the 15-minute period length as proof of automatic schedule removal.
 - **Fallback if cloud writes flake**: *deferred — not implemented (2026-04-26)*. See "Modbus fallback (deferred)" below for what this would buy us and what it'd take to add later.
 
 ## Architecture (proposed)
@@ -76,15 +74,16 @@ Single Python service running in a long-lived loop:
 └─────────────────────────────────────────────────────────┘
 ```
 
-No persistence layer: the service is idempotent on restart. The startup
-hook clears any pre-existing AC-charge schedule so the inverter state always
-starts from a known-disabled baseline.
+No persistence layer: the service is idempotent on restart. At startup, it writes
+its three-slot layout: it configures the permanent cheap-window slot, clears the
+dynamic slot, and disables slot 3. This overwrites prior settings for those slots;
+the permanent slot remains configured at shutdown.
 
 Loop cadence:
 - Octopus polled every 120s.
 - Hypervolt WS pushes state changes; reconnect on drop.
 - Decision recomputed every 60s and on any WS event.
-- Growatt write only on `cheap_now` edges, plus a 10-min keepalive while true.
+- Dynamic Growatt slot writes on decision edges, plus a 10-min keepalive while active; every write also reasserts the permanent slot and disables slot 3.
 
 Logging: plain-text lines to stdout (`%(asctime)s %(levelname)s %(name)s %(message)s`). The user can pipe into journald/Docker logs. JSON was considered but the deployment target reads logs through `docker logs`, where structured fields don't add enough value to justify the extra dependency.
 
@@ -94,11 +93,12 @@ Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs
 
 - 2026-04-25: Host = Docker container on NAS.
 - 2026-04-25: Battery = ARK 7.6L; AC-charge target SoC = **100%**.
-- 2026-04-25: Script owns the nightly 23:00–05:30 schedule (clears existing inverter schedule on first run).
+- 2026-04-25: Script owns the nightly 23:00–05:30 schedule (clears existing inverter schedule on first run). Historical design; superseded by the 2026-11-22 slot layout and 23:30 default below.
 - 2026-04-25: User has Hypervolt login & Growatt API token already; Octopus API key still to be obtained.
 - 2026-04-25: AC-charge rate = inverter max (~3 kW for SPH3000).
 - 2026-04-25: Full-battery during dispatch = no-op (just stop charging).
 - 2026-04-25: Solar producing during a daytime dispatch = force grid AC-charge anyway.
+- 2026-11-22: Confirmed current behavior: permanent configurable overnight slot (default 23:30–05:30) plus a dynamic slot only for an active planned dispatch with confirmed EV charging; unknown/stale EV state fails closed, and no Hypervolt-only fallback is used. The service writes all three Growatt slots, with the permanent window retained if the service stops.
 
 ## Notes
 
@@ -115,8 +115,8 @@ Deploy: Docker container on the user's NAS, restart `unless-stopped`. Image runs
 
 ## Top risks (carried forward)
 
-1. **Stale force-charge state.** If the script crashes mid-dispatch, the inverter could stay in AC-charge into peak rate. Mitigation: short sliding-window writes (15 min) that auto-expire, plus a watchdog that clears the schedule on startup.
-2. **Octopus API misses a dispatch.** Hypervolt power-draw fallback covers this, but introduces a small risk of force-charging during a *manual* boost charge (user pays peak rate twice). Mitigation: only trust the Hypervolt-only signal during plausible dispatch hours, never 17:00–22:00 when the user might genuinely boost-charge at peak rate.
+1. **Dynamic slot left active after a crash.** If the service stops ungracefully while a dynamic charge is active, slot 2 may remain configured; automatic removal after 15 minutes is not established by the code. Mitigation: normal shutdown and the next startup clear the dynamic slot; the permanent overnight slot remains configured independently.
+2. **Missed dispatch or unavailable EV state.** If Octopus misses a dispatch or Hypervolt state is unknown/stale, dynamic charging is not enabled even if the EV is drawing power. This fail-closed behavior avoids charging on an unconfirmed Hypervolt-only signal but can leave the home battery supporting the EV during a cheap dispatch.
 3. **Growatt cloud write flakiness.** Open HA regression on `write_ac_charge_times` (home-assistant/core#166817, Mar 2026). We're not using HA, so we sidestep it, but the underlying API still wobbles. No parachute today (Modbus fallback deferred — see below); a sustained Growatt cloud outage means no dynamic AC-charge writes. The permanent slot 1 keeps honoring the nightly window regardless.
 
 ## Deferred work

@@ -16,15 +16,9 @@ This service automates AC charging of a Growatt SPH3000 home battery around the 
 
 ## Charging behavior and decision records
 
-The current implementation configures Growatt slot 1 as a permanent cheap-window fallback and uses slot 2 for a short-lived dynamic charge window; slot 3 remains disabled. The permanent slot is asserted on startup and each Growatt write, while the dynamic slot is cleared on startup and shutdown. The dynamic decision is true only when an Octopus planned dispatch is active **and** Hypervolt reports that the EV is charging. It is evaluated periodically, with a keepalive while active.
+The current implementation configures Growatt slot 1 as a permanent cheap-window schedule (default 23:30–05:30, configurable), uses slot 2 for a short-lived dynamic charge window, and disables slot 3. Every Growatt write supplies all three slots, so prior settings are overwritten. Startup asserts the permanent slot and clears the dynamic slot; shutdown clears the dynamic slot but leaves the permanent window configured.
 
-There are known differences between `DECISIONS.md` and the implementation that must not be silently resolved:
-
-- The decision record describes a 23:00 start, while the code default is 23:30 (`CHEAP_WINDOW_START`); both use 05:30 as the end by default.
-- The decision record specifies an OR-based combination including the standard window and a Hypervolt fallback. In the current code, the overnight window is handled by the permanent inverter slot, and the dynamic slot requires both an active planned dispatch and active EV charging.
-- The decision record describes clearing the existing inverter schedule; the current client instead maintains the permanent slot and clears only the dynamic slot.
-
-Treat the code as evidence of current behavior and `DECISIONS.md` as the record of user intent and prior choices. Before changing charging criteria, schedules, charge targets, or inverter ownership, surface the discrepancy and get the user's direction. When the user makes a new design decision, update `DECISIONS.md` as well as implementing it; do not rewrite historical decisions as if they were always current.
+The dynamic decision is true only when an Octopus planned dispatch is active **and** Hypervolt confirms that the EV is charging. False, unknown, or stale Hypervolt state does not enable dynamic charging; there is no Hypervolt-only fallback. The decision is evaluated periodically, with a keepalive while active. `DECISIONS.md` records the current behavior, design context, and historical decisions. Before changing charging criteria, schedules, charge targets, or inverter ownership, get the user's direction; record new decisions there without rewriting historical decisions as if they were always current.
 
 ## Development and validation
 

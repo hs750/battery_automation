@@ -1,6 +1,6 @@
 # battery_automation
 
-Mirrors Octopus Intelligent Go cheap-rate signals onto a Growatt SPH3000 home battery, so the battery AC-charges from the grid whenever IOG has dispatched the EV charger off-window (and during the standard 23:00–05:30 window). See [`DECISIONS.md`](./DECISIONS.md) for the full design, API choices, and risks.
+Mirrors Octopus Intelligent Go charging onto a Growatt SPH3000 home battery. The permanent overnight AC-charge window defaults to 23:30–05:30 and is configurable; dynamic charging is enabled only while an Octopus planned dispatch is active and Hypervolt confirms the EV is charging. Unknown or stale EV state does not trigger dynamic charging. See [`DECISIONS.md`](./DECISIONS.md) for the full design, API choices, and risks.
 
 ## Run locally
 
